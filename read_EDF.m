@@ -3,11 +3,11 @@ function varargout = read_EDF(edf_fname, varargin)
 %
 %   READ_EDF reads European Data Format (EDF/EDF+) files using a compiled MEX
 %   reader when available, and a pure MATLAB fallback otherwise. The function
-%   provides full access to header metadata, per-signal scaling (digital-to-
+%   provides full access to header metadata, per-signal_cellnal scaling (digital-to-
 %   physical conversion), and EDF+ annotations.
 %
 %   Usage:
-%       [hdr, sh, sig, ann] = read_EDF(filename, 'Channels', {'EEG Fpz-Cz'})
+%       [header, signal_header, signal_cell, annotations] = read_EDF(filename, 'Channels', {'EEG Fpz-Cz'})
 %
 %   Inputs:
 %       edf_fname      : string - EDF or EDF+ file path
@@ -18,18 +18,18 @@ function varargout = read_EDF(edf_fname, varargin)
 %       'forceMATLAB'  : logical - disable MEX usage (default: false)
 %
 %   Outputs:
-%       hdr   : structure containing EDF file-level metadata
-%       sh    : structure array of per-signal headers
-%       sig   : cell array containing each signal vector (in physical units)
-%       ann   : structure array of EDF+ annotations with onset and text
+%       header   : structure containing EDF file-level metadata
+%       signal_header    : structure array of per-signal_cellnal headers
+%       signal_cell   : cell array containing each signal_cellnal vector (in physical units)
+%       annotations   : structure array of EDF+ annotations with onset and text
 %
 %   Example:
-%       [hdr, sh, sig, ann] = read_EDF('sleep.edf', 'Channels', {'EEG C3-A2'});
+%       [header, signal_header, signal_cell, annotations] = read_EDF('sleep.edf', 'Channels', {'EEG C3-A2'});
 %
 %   -------------------------------------------------------------------------
 %   EDF File Specification Summary:
 %       • Each EDF file begins with a fixed-length 256-byte main header
-%       • Followed by per-signal headers (16 fields × N signals)
+%       • Followed by per-signal_cellnal headers (16 fields × N signal_cellnals)
 %       • Digital samples stored as int16 are scaled to physical units:
 %
 %             phys_val = phys_min + (dig_val - dig_min) * (phys_max - phys_min) / (dig_max - dig_min)
@@ -81,6 +81,18 @@ if ~force_matlab
     if mex_exists
         try
             [varargout{1:nargout}] = read_EDF_mex(edf_fname, channels, epochs, verbose, repair_header);
+            % ---------------- Add total data length fields ----------------
+            total_seconds = varargout{1}.num_data_records * varargout{1}.data_record_duration;
+            varargout{1}.total_data_seconds = total_seconds;
+            dur = seconds(total_seconds);
+            dur.Format="hh:mm:ss.SSS";
+            varargout{1}.total_data_hms = char(dur);
+
+
+            if verbose
+                fprintf('Total data length: %.2f sec (%s)\n', varargout{1}.total_data_seconds, varargout{1}.total_data_hms);
+            end
+
             return;
         catch ME
             if verbose
@@ -94,6 +106,19 @@ end
 
 %% ---------------- MATLAB FALLBACK ----------------
 [varargout{1:nargout}] = read_EDF_matlab(edf_fname, channels, epochs, verbose, repair_header);
+
+% ---------------- Add total data length fields ----------------
+total_seconds = varargout{1}.num_data_records * varargout{1}.data_record_duration;
+varargout{1}.total_data_seconds = total_seconds;
+dur = seconds(total_seconds);
+dur.Format="hh:mm:ss.SSS";
+varargout{1}.total_data_hms = char(dur);
+
+
+if verbose
+    fprintf('Total data length: %.2f sec (%s)\n', varargout{1}.total_data_seconds, varargout{1}.total_data_hms);
+end
+
 end
 
 
@@ -127,58 +152,55 @@ for k = 1:numel(header_fields)
     end
 end
 
-% ---------------- Add total data length fields ----------------
-total_seconds = header.num_data_records * header.data_record_duration;
-header.total_data_seconds = total_seconds;
-dur = seconds(total_seconds);
-dur.Format="hh:mm:ss.SSS";
-header.total_data_hms = char(dur);
-
-
-if verbose
-    fprintf('Total data length: %.2f sec (%s)\n', header.total_data_seconds, header.total_data_hms);
+% Check for data record mismatches
+if header.num_data_records == -1 || isnan(header.num_data_records)
+    warning('read_EDF:InvalidDataRecords', 'num_data_records is -1 or invalid.');
 end
 
 % ---------------- Read Per-Signal Headers ----------------
 fseek(fid, 256, 'bof');
 num_signals = header.num_signals;
-sig_header_size = header.num_header_bytes - 256;
-A = fread(fid, sig_header_size, 'uint8=>char')';
-sig_fields = {'signal_labels','transducer_type','physical_dimension',...
+signal_cell_header_size = header.num_header_bytes - 256;
+A = fread(fid, signal_cell_header_size, 'uint8=>char')';
+signal_cell_fields = {'signal_labels','transducer_type','physical_dimension',...
     'physical_min','physical_max','digital_min','digital_max',...
     'prefiltering','samples_in_record','reserve_2'};
-sig_field_sizes = [16,80,8,8,8,8,8,80,8,32];
-loc = [0; cumsum(sig_field_sizes(:)*num_signals)];
+signal_cell_field_sizes = [16,80,8,8,8,8,8,80,8,32];
+loc = [0; cumsum(signal_cell_field_sizes(:)*num_signals)];
 signal_header = struct();
-for f = 1:numel(sig_fields)
+for f = 1:numel(signal_cell_fields)
     block = A(loc(f)+1:loc(f+1));
     for s = 1:num_signals
-        start_idx = (s-1)*sig_field_sizes(f)+1;
-        end_idx = s*sig_field_sizes(f);
+        start_idx = (s-1)*signal_cell_field_sizes(f)+1;
+        end_idx = s*signal_cell_field_sizes(f);
         val = strtrim(block(start_idx:end_idx));
-        if any(strcmp(sig_fields{f},{'physical_min','physical_max','digital_min','digital_max','samples_in_record'}))
+        if any(strcmp(signal_cell_fields{f},{'physical_min','physical_max','digital_min','digital_max','samples_in_record'}))
             val = str2double(val);
         end
-        signal_header(s).(sig_fields{f}) = val;
+        signal_header(s).(signal_cell_fields{f}) = val;
     end
 end
 
 % ---------------- Validate Channel List ----------------
-labels = strtrim({signal_header.signal_labels});
+labels = cellfun(@deblank,{signal_header.signal_labels},'UniformOutput',false);
 if isempty(channels)
     signal_indices = 1:num_signals;
 else
-    signal_indices = find(ismember(labels, channels));
-    invalid_channels = setdiff(channels, labels);
+    channels_trimmed = cellfun(@strtrim, channels, 'UniformOutput', false);
+    signal_indices = find(ismember(labels, channels_trimmed));
+    invalid_channels = setdiff(channels_trimmed, labels);
     if ~isempty(invalid_channels)
+        invalid_str = sprintf('%s, ', invalid_channels{:});
+        valid_str = sprintf('%s, ', labels{:});
         warning('read_EDF:InvalidChannel', ...
             'Some channels not found: %s\nValid channels: %s', ...
-            strjoin(invalid_channels, ', '), strjoin(labels, ', '));
+            invalid_str(1:end-2), valid_str(1:end-2));
     end
     if isempty(signal_indices)
+        valid_str = sprintf('%s, ', labels{:});
         error('read_EDF:NoValidChannels', ...
-            'No valid channels found.\nRequested: %s\nAvailable: %s', ...
-            strjoin(channels, ', '), strjoin(labels, ', '));
+            'No valid channels found.\nAvailable: %s', ...
+            valid_str(1:end-2));
     end
 end
 
@@ -199,13 +221,64 @@ else
 end
 num_epochs = end_epoch - start_epoch + 1;
 
+% Update header with actual record count and duration
+actual_records = length(raw) / record_size;
+if actual_records ~= num_records
+    warning('read_EDF:HeaderUpdate', ...
+        'Updating header: num_data_records changed from %d to %d', ...
+        num_records, actual_records);
+    header.num_data_records = actual_records;
+end
+total_seconds = header.num_data_records * header.data_record_duration;
+header.total_data_seconds = total_seconds;
+dur = seconds(total_seconds);
+dur.Format="hh:mm:ss.SSS";
+header.total_data_hms = char(dur);
+if verbose
+    fprintf('Header updated: Total data length: %.2f sec (%s)\n', header.total_data_seconds, header.total_data_hms);
+end
+
+% ---------------- Repair Header if Requested ----------------
+record_size = sum(samples_per_record);  % samples per record
+actual_records = length(raw) / record_size;
+
+if repair_header
+    if verbose
+        fprintf('RepairHeader = true: correcting num_data_records from %d to %d\n', ...
+            header.num_data_records, actual_records);
+    end
+    header.num_data_records = actual_records;
+
+    % Optional: save repaired EDF copy
+    [pathstr, name, ext] = fileparts(edf_fname);
+    fixed_fname = fullfile(pathstr, [name '_fixed' ext]);
+    fid_orig = fopen(edf_fname, 'r', 'ieee-le');
+    fid_fixed = fopen(fixed_fname, 'w', 'ieee-le');
+    if fid_orig > 0 && fid_fixed > 0
+        hdr = fread(fid_orig, header.num_header_bytes, 'uint8=>uint8');
+        % Overwrite num_data_records field (bytes 237-244 in header, zero-based index)
+        num_records_str = sprintf('%-8d', actual_records);
+        hdr(237:244) = uint8(num_records_str);
+        fwrite(fid_fixed, hdr, 'uint8');
+        % Copy remaining file data
+        fseek(fid_orig, header.num_header_bytes, 'bof');
+        data_bytes = fread(fid_orig, inf, 'uint8=>uint8');
+        fwrite(fid_fixed, data_bytes, 'uint8');
+        fclose(fid_orig); fclose(fid_fixed);
+        if verbose
+            fprintf('Repaired EDF saved as: %s\n', fixed_fname);
+        end
+    end
+end
+
+
 % ---------------- EDF Digital-to-Physical Conversion ----------------
-signal_cell = cell(1, length(signal_indices));
+signal_cells = cell(1, length(signal_indices));
 for i = 1:length(signal_indices)
     sidx = signal_indices(i);
-    sig_offset = sum(samples_per_record(1:sidx-1));
+    signal_cell_offset = sum(samples_per_record(1:sidx-1));
     num_samples = samples_per_record(sidx) * num_epochs;
-    sig = zeros(1, num_samples, 'double');
+    signal_cell = zeros(1, num_samples, 'double');
 
     dig_min = double(signal_header(sidx).digital_min);
     dig_max = double(signal_header(sidx).digital_max);
@@ -220,27 +293,27 @@ for i = 1:length(signal_indices)
         scale = (phy_max - phy_min) / (dig_max - dig_min);
     end
 
-    if verbose, fprintf('Reading signal %s...\n', signal_header(sidx).signal_labels); end
+    if verbose, fprintf('Reading signal_cellnal %s...\n', signal_header(sidx).signal_cell); end
 
     for r = 1:num_epochs
         record_idx = start_epoch + r - 1;
-        rec_start = (record_idx - 1) * record_size + sig_offset + 1;
+        rec_start = (record_idx - 1) * record_size + signal_cell_offset + 1;
         rec_end = rec_start + samples_per_record(sidx) - 1;
         raw_vals = double(raw(rec_start:rec_end));
-        sig_start = (r - 1) * samples_per_record(sidx) + 1;
-        sig_end = r * samples_per_record(sidx);
-        sig(sig_start:sig_end) = phy_min + (raw_vals - dig_min) * scale;
+        signal_cell_start = (r - 1) * samples_per_record(sidx) + 1;
+        signal_cell_end = r * samples_per_record(sidx);
+        signal_cell(signal_cell_start:signal_cell_end) = phy_min + (raw_vals - dig_min) * scale;
     end
-    signal_cell{i} = sig;
+    signal_cells{i} = signal_cell;
 end
 
-signal_header_out = signal_header(signal_indices);
+signal_header = signal_header(signal_indices);
 annotations = extractAnnotations(edf_fname, header, signal_header);
 
-% ---------------- Output Assignment ----------------
+% ---------------- Output Assignal_cellnment ----------------
 varargout{1} = header;
-if nargout > 1, varargout{2} = signal_header_out; end
-if nargout > 2, varargout{3} = signal_cell; end
+if nargout > 1, varargout{2} = signal_header; end
+if nargout > 2, varargout{3} = signal_cells; end
 if nargout > 3, varargout{4} = annotations; end
 end
 
@@ -276,7 +349,7 @@ if ~isempty(allAnnotations)
     valid = allAnnotations(mask);
     if ~isempty(valid)
         annotations = struct('onset', num2cell([valid.onset])', ...
-                             'text', {valid.texts}');
+            'text', {valid.texts}');
     end
 end
 end
