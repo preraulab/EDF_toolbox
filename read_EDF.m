@@ -187,7 +187,7 @@ if isempty(channels)
     signal_indices = 1:num_signals;
 else
     channels_trimmed = cellfun(@strtrim, channels, 'UniformOutput', false);
-    signal_indices = find(ismember(labels, channels_trimmed));
+    signal_indices = find(ismember(lower(labels), lower(channels_trimmed)));
     invalid_channels = setdiff(channels_trimmed, labels);
     if ~isempty(invalid_channels)
         invalid_str = sprintf('%s, ', invalid_channels{:});
@@ -293,7 +293,7 @@ for i = 1:length(signal_indices)
         scale = (phy_max - phy_min) / (dig_max - dig_min);
     end
 
-    if verbose, fprintf('Reading signal_cellnal %s...\n', signal_header(sidx).signal_cell); end
+    if verbose & ~isempty(signal_header), fprintf('     Reading %s...\n',signal_header(sidx).signal_labels); end
 
     for r = 1:num_epochs
         record_idx = start_epoch + r - 1;
