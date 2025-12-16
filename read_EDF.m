@@ -271,6 +271,10 @@ if repair_header
     end
 end
 
+%Compute sampling frequency
+for ii = 1:length(signal_header)
+    signal_header(ii).sampling_frequency = signal_header(ii).samples_in_record / header.data_record_duration;
+end
 
 % ---------------- EDF Digital-to-Physical Conversion ----------------
 signal_cells = cell(1, length(signal_indices));
