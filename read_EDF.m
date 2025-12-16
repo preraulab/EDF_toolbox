@@ -16,6 +16,7 @@ function varargout = read_EDF(edf_fname, varargin)
 %       'Verbose'      : logical - print progress and status info (default: false)
 %       'RepairHeader' : logical - correct invalid record counts (default: false)
 %       'forceMATLAB'  : logical - disable MEX usage (default: false)
+%       'debug'        : logical - debug mode for MEX (default: false)
 %
 %   Outputs:
 %       header   : structure containing EDF file-level metadata
@@ -53,12 +54,14 @@ addParameter(p, 'Epochs', [], @isnumeric);
 addParameter(p, 'Verbose', false, @islogical);
 addParameter(p, 'RepairHeader', false, @islogical);
 addParameter(p, 'forceMATLAB', false, @islogical);
+addParameter(p, 'debug', false, @islogical);
 parse(p, varargin{:});
 channels = p.Results.Channels;
 epochs = p.Results.Epochs;
 verbose = p.Results.Verbose;
 repair_header = p.Results.RepairHeader;
 force_matlab = p.Results.forceMATLAB;
+debug = p.Results.forceMATLAB;
 
 %% ---------------- MEX HANDLING ----------------
 script_dir = fileparts(mfilename('fullpath'));
@@ -70,7 +73,7 @@ if ~force_matlab
         try
             if verbose, fprintf('Compiling read_EDF_mex.c...\n'); end
             cd(script_dir);
-            mex('read_EDF_mex.c');
+            mex -O -largeArrayDims read_EDF_mex.c;
             cd(script_dir);
             mex_exists = isfile(mex_file);
         catch
@@ -80,7 +83,7 @@ if ~force_matlab
     end
     if mex_exists
         try
-            [varargout{1:nargout}] = read_EDF_mex(edf_fname, channels, epochs, verbose, repair_header);
+            [varargout{1:nargout}] = read_EDF_mex(edf_fname, channels, epochs, verbose, repair_header, debug);
             % ---------------- Add total data length fields ----------------
             total_seconds = varargout{1}.num_data_records * varargout{1}.data_record_duration;
             varargout{1}.total_data_seconds = total_seconds;
