@@ -5,48 +5,60 @@ function [header_tbl, signal_tbl, uifig, uitable_header, uitable_signal] = heade
 %       [header_tbl, signal_tbl] = header_gui(header, signal_header)
 %       [header_tbl, signal_tbl, uifig, uitable_header, uitable_signal] = header_gui(header, signal_header)
 %       [...] = header_gui(header, signal_header, 'Parent', parentHandle)
+%       [...] = header_gui(header, signal_header, 'CreateGUI', false)
 %
 %   Input:
-%       header: struct - EDF main header structure -- required
+%       header: struct - EDF main header structure returned by read_EDF -- required
 %       signal_header: struct array - EDF per-signal header structures -- required
 %
 %   Name-Value Pairs:
 %       'Parent': graphics handle - UIFIGURE or UIPANEL to contain the tables
 %                 (default: new UIFIGURE)
+%       'CreateGUI': logical - create GUI and uitables (default: true)
 %
 %   Output:
 %       header_tbl: table - prettified table version of header struct
 %       signal_tbl: table - prettified table version of signal_header struct
-%       uifig: UIFIGURE handle (empty if Parent is supplied)
+%       uifig: UIFIGURE handle (empty if GUI not created or Parent supplied)
 %       uitable_header: uitable handle displaying header fields
 %       uitable_signal: uitable handle displaying signal header fields
 %
-%   Notes:
-%       - If only header_tbl and/or signal_tbl are requested, no GUI is created.
-%       - If additional outputs are requested, or if no outputs are requested,
-%         the GUI and uitables are created.
-%       - Tables automatically resize with the parent container.
-%
 %   See also:
-%       uitable, uifigure, struct2table
+%       read_EDF, uitable, uifigure, struct2table
 
 %************************************************************
-%                 PARSE NAME-VALUE PAIRS
+%                 DEFINE REQUIRED EDF FIELDS
+%************************************************************
+required_header_fields = { ...
+    'edf_ver', 'patient_id', 'local_rec_id', ...
+    'recording_startdate', 'recording_starttime', ...
+    'num_header_bytes', 'num_data_records', ...
+    'data_record_duration', 'num_signals', ...
+    'total_data_seconds', 'total_data_hms'};
+
+required_signal_fields = { ...
+    'signal_labels', 'transducer_type', 'physical_dimension', ...
+    'physical_min', 'physical_max', ...
+    'digital_min', 'digital_max', ...
+    'prefiltering', 'samples_in_record', ...
+    'sampling_frequency'};
+
+%************************************************************
+%                 PARSE INPUTS AND OPTIONS
 %************************************************************
 p = inputParser;
-addParameter(p, 'Parent', [], @(x) isempty(x) || isgraphics(x));
-parse(p, varargin{:});
-parent = p.Results.Parent;
+p.FunctionName = 'header_gui';
 
-%************************************************************
-%               VALIDATE INPUT STRUCTURES
-%************************************************************
-if ~isstruct(header) || isempty(header)
-    error('header_gui:InvalidInput', 'Header must be a non-empty structure.');
-end
-if ~isstruct(signal_header)
-    error('header_gui:InvalidInput', 'Signal header must be a structure array.');
-end
+addRequired(p, 'header', @(x) validateHeaderStruct(x, required_header_fields));
+addRequired(p, 'signal_header', @(x) validateSignalHeaderStruct(x, required_signal_fields));
+
+addParameter(p, 'Parent', [], @(x) isempty(x) || isgraphics(x));
+addParameter(p, 'CreateGUI', true, @(x) islogical(x) && isscalar(x));
+
+parse(p, header, signal_header, varargin{:});
+
+parent    = p.Results.Parent;
+createGUI = p.Results.CreateGUI;
 
 %************************************************************
 %              CONVERT STRUCTS TO TABLES
@@ -62,9 +74,9 @@ if ~isempty(signal_tbl)
 end
 
 %************************************************************
-%        EARLY RETURN IF ONLY TABLES ARE REQUESTED
+%              EXIT EARLY IF GUI NOT REQUESTED
 %************************************************************
-if nargout <= 2
+if ~createGUI
     uifig = [];
     uitable_header = [];
     uitable_signal = [];
@@ -138,6 +150,45 @@ uitable_header.Units = 'normalized';
 uitable_signal.Units = 'normalized';
 parent.Units = originalUnits;
 
+end
+
+%************************************************************
+%          VALIDATE MAIN EDF HEADER STRUCTURE
+%************************************************************
+function tf = validateHeaderStruct(h, required_fields)
+tf = false;
+if ~isstruct(h) || ~isscalar(h)
+    error('header_gui:InvalidHeader', ...
+        'header must be a scalar struct returned by read_EDF.');
+end
+missing = setdiff(required_fields, fieldnames(h));
+if ~isempty(missing)
+    error('header_gui:MissingHeaderFields', ...
+        'Header missing required fields: %s', strjoin(missing, ', '));
+end
+tf = true;
+end
+
+%************************************************************
+%        VALIDATE PER-SIGNAL HEADER STRUCTURE
+%************************************************************
+function tf = validateSignalHeaderStruct(sh, required_fields)
+tf = false;
+if ~isstruct(sh)
+    error('header_gui:InvalidSignalHeader', ...
+        'signal_header must be a struct array returned by read_EDF.');
+end
+if isempty(sh)
+    tf = true;
+    return;
+end
+fn = fieldnames(sh);
+missing = setdiff(required_fields, fn);
+if ~isempty(missing)
+    error('header_gui:MissingSignalHeaderFields', ...
+        'Signal header missing required fields: %s', strjoin(missing, ', '));
+end
+tf = true;
 end
 
 %************************************************************
