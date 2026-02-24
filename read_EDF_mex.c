@@ -23,9 +23,10 @@
 /* ============================================================
 *                         DEBUG MACROS
 * ============================================================ */
-#define DBG(...) do { if (debug) mexPrintf(__VA_ARGS__); } while (0)
+static int g_debug = 0;
+#define DBG(...) do { if (g_debug) mexPrintf(__VA_ARGS__); } while (0)
 #define ASSERT(cond) \
-do { if (debug && !(cond)) mexErrMsgIdAndTxt("read_EDF_mex:Assert", #cond); } while (0)
+do { if (g_debug && !(cond)) mexErrMsgIdAndTxt("read_EDF_mex:Assert", #cond); } while (0)
 
 /* ============================================================
 *                         STRUCTS
@@ -126,6 +127,18 @@ static void fix_num_records(FILE *fid, EDF_Header *hdr,
     mwSize total_samp_per_rec = 0;
     for (int i=0;i<hdr->num_signals;i++)
         total_samp_per_rec += sig[i].samples_in_record;
+
+    DBG("\n===== DERIVED RECORD INFO =====\n");
+    DBG("Total samples per record: %llu\n",
+        (unsigned long long)total_samp_per_rec);
+
+    for (int i=0;i<hdr->num_signals;i++) {
+        DBG("Signal %d samples_in_record: %d\n",
+            i, sig[i].samples_in_record);
+    }
+    DBG("===============================\n\n");
+
+    ASSERT(total_samp_per_rec > 0);
 
     mwSize bytes_per_rec = total_samp_per_rec * 2;
 
@@ -234,13 +247,13 @@ static void parse_tal_block_fast(
 *                         MEX ENTRY
 * ============================================================ */
 
-void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
-
+void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
+{
     if (nrhs < 1)
         mexErrMsgIdAndTxt("read_EDF_mex:Input","Filename required");
 
     int verbose = (nrhs>3 && mxGetScalar(prhs[3])!=0);
-    int debug   = (nrhs>5 && mxGetScalar(prhs[5])!=0);
+    g_debug     = (nrhs>5 && mxGetScalar(prhs[5])!=0);
 
     char fname[4096];
     mxGetString(prhs[0], fname, sizeof(fname));
@@ -248,129 +261,273 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
     FILE *fid = fopen(fname,"rb");
     if (!fid) mexErrMsgIdAndTxt("read_EDF_mex:File","Cannot open file");
 
+    /* ============================================================
+    *                         READ MAIN HEADER
+    * ============================================================ */
+
     EDF_Header hdr;
     if (!read_edf_header(fid,&hdr))
         mexErrMsgIdAndTxt("read_EDF_mex:Header","Invalid EDF header");
+
+    DBG("\n===== EDF MAIN HEADER =====\n");
+    DBG("Header bytes: %d\n", hdr.num_header_bytes);
+    DBG("Num data records (header): %d\n", hdr.num_data_records);
+    DBG("Record duration: %.6f\n", hdr.data_record_duration);
+    DBG("Num signals: %d\n", hdr.num_signals);
+    DBG("===========================\n\n");
+
+    ASSERT(hdr.num_signals > 0);
+    ASSERT(hdr.num_header_bytes >= 256);
+    ASSERT(hdr.data_record_duration > 0);
+
+    /* ============================================================
+    *                       READ SIGNAL HEADERS
+    * ============================================================ */
 
     Signal_Header *sig = mxCalloc(hdr.num_signals,sizeof(Signal_Header));
     read_signal_headers(fid,sig,hdr.num_signals);
 
     mwSize total_samp_per_rec = 0;
     int annot_idx = -1;
+
+    DBG("\n===== SIGNAL HEADERS =====\n");
+
     for (int i=0;i<hdr.num_signals;i++) {
-        sig[i].sampling_frequency = sig[i].samples_in_record / hdr.data_record_duration;
+        sig[i].sampling_frequency =
+            sig[i].samples_in_record / hdr.data_record_duration;
+
         total_samp_per_rec += sig[i].samples_in_record;
+
+        DBG("Signal %d: %s\n", i, sig[i].signal_labels);
+        DBG("  samples/record: %d\n", sig[i].samples_in_record);
+        DBG("  digital min/max: %f / %f\n",
+            sig[i].digital_min, sig[i].digital_max);
+
         if (strcmp(sig[i].signal_labels,"EDF Annotations")==0)
             annot_idx = i;
     }
 
+    DBG("Total samples per record: %llu\n",
+        (unsigned long long)total_samp_per_rec);
+    DBG("===========================\n\n");
+
+    ASSERT(total_samp_per_rec > 0);
+
     /* ============================================================
-    *     FIX EDF+ num_data_records BEFORE ANY OUTPUT
+    *                 FIX EDF+ num_data_records
     * ============================================================ */
 
     int repair = (nrhs>4 && mxGetScalar(prhs[4])!=0);
-
     fix_num_records(fid, &hdr, sig, fname, verbose, repair);
 
-    /* recompute bytes_per_rec using possibly corrected record count */
     mwSize bytes_per_rec = total_samp_per_rec * 2;
 
-    /* ===================== Signal Data (conditional) ===================== */
+    /* ============================================================
+    *                 READ RAW DATA (if requested)
+    * ============================================================ */
+
     unsigned char *raw = NULL;
-    mwSize nrec = 0, bytes_per_rec = total_samp_per_rec*2;
-    if (nlhs >= 3) {  // only read raw data if user requested it
+    mwSize data_bytes = 0;
+
+    if (nlhs >= 3)
+    {
         fseek(fid,0,SEEK_END);
         mwSize fsize = ftell(fid);
-        mwSize data_bytes = fsize - hdr.num_header_bytes;
-        nrec = data_bytes / bytes_per_rec;
+        data_bytes = fsize - hdr.num_header_bytes;
+
+        DBG("\n===== FILE SIZE CHECK =====\n");
+        DBG("File size: %llu\n", (unsigned long long)fsize);
+        DBG("Header bytes: %d\n", hdr.num_header_bytes);
+        DBG("Data bytes: %llu\n", (unsigned long long)data_bytes);
+        DBG("Bytes per record: %llu\n",
+            (unsigned long long)bytes_per_rec);
+        DBG("Expected data bytes: %llu\n",
+            (unsigned long long)
+            ((mwSize)hdr.num_data_records * bytes_per_rec));
+        DBG("===========================\n\n");
+
+        ASSERT(bytes_per_rec > 0);
+        ASSERT(data_bytes > 0);
 
         raw = mxMalloc(data_bytes);
+
         fseek(fid,hdr.num_header_bytes,SEEK_SET);
-        fread(raw,1,data_bytes,fid);
+        size_t nread = fread(raw,1,data_bytes,fid);
+
+        DBG("fread requested: %llu\n",
+            (unsigned long long)data_bytes);
+        DBG("fread returned:  %llu\n",
+            (unsigned long long)nread);
+
+        ASSERT(nread == data_bytes);
     }
 
-    /* ===================== Header Output ===================== */
+    /* ============================================================
+    *                         HEADER OUTPUT
+    * ============================================================ */
+
     if (nlhs>=1) {
-        const char *f[]={"edf_ver","patient_id","local_rec_id","recording_startdate",
-                         "recording_starttime","num_header_bytes","num_data_records",
+        const char *f[]={"edf_ver","patient_id","local_rec_id",
+                         "recording_startdate","recording_starttime",
+                         "num_header_bytes","num_data_records",
                          "data_record_duration","num_signals"};
+
         plhs[0]=mxCreateStructMatrix(1,1,9,f);
-        mxSetField(plhs[0],0,"edf_ver",mxCreateString(hdr.edf_ver));
-        mxSetField(plhs[0],0,"patient_id",mxCreateString(hdr.patient_id));
-        mxSetField(plhs[0],0,"local_rec_id",mxCreateString(hdr.local_rec_id));
-        mxSetField(plhs[0],0,"recording_startdate",mxCreateString(hdr.recording_startdate));
-        mxSetField(plhs[0],0,"recording_starttime",mxCreateString(hdr.recording_starttime));
-        mxSetField(plhs[0],0,"num_header_bytes",mxCreateDoubleScalar(hdr.num_header_bytes));
-        mxSetField(plhs[0],0,"num_data_records",mxCreateDoubleScalar((double)hdr.num_data_records));
-        mxSetField(plhs[0],0,"data_record_duration",mxCreateDoubleScalar(hdr.data_record_duration));
-        mxSetField(plhs[0],0,"num_signals",mxCreateDoubleScalar(hdr.num_signals));
+
+        mxSetField(plhs[0],0,"edf_ver",
+                   mxCreateString(hdr.edf_ver));
+        mxSetField(plhs[0],0,"patient_id",
+                   mxCreateString(hdr.patient_id));
+        mxSetField(plhs[0],0,"local_rec_id",
+                   mxCreateString(hdr.local_rec_id));
+        mxSetField(plhs[0],0,"recording_startdate",
+                   mxCreateString(hdr.recording_startdate));
+        mxSetField(plhs[0],0,"recording_starttime",
+                   mxCreateString(hdr.recording_starttime));
+        mxSetField(plhs[0],0,"num_header_bytes",
+                   mxCreateDoubleScalar(hdr.num_header_bytes));
+        mxSetField(plhs[0],0,"num_data_records",
+                   mxCreateDoubleScalar((double)hdr.num_data_records));
+        mxSetField(plhs[0],0,"data_record_duration",
+                   mxCreateDoubleScalar(hdr.data_record_duration));
+        mxSetField(plhs[0],0,"num_signals",
+                   mxCreateDoubleScalar(hdr.num_signals));
     }
 
-    /* ===================== Signal Header Output ===================== */
+    /* ============================================================
+    *                     SIGNAL HEADER OUTPUT
+    * ============================================================ */
+
     if (nlhs>=2) {
-        const char *f[]={"signal_labels","transducer_type","physical_dimension",
-                         "physical_min","physical_max","digital_min","digital_max",
-                         "prefiltering","samples_in_record","sampling_frequency"};
+        const char *f[]={"signal_labels","transducer_type",
+                         "physical_dimension","physical_min",
+                         "physical_max","digital_min",
+                         "digital_max","prefiltering",
+                         "samples_in_record","sampling_frequency"};
+
         plhs[1]=mxCreateStructMatrix(1,hdr.num_signals,10,f);
+
         for (int i=0;i<hdr.num_signals;i++) {
-            mxSetField(plhs[1],i,"signal_labels",mxCreateString(sig[i].signal_labels));
-            mxSetField(plhs[1],i,"transducer_type",mxCreateString(sig[i].transducer_type));
-            mxSetField(plhs[1],i,"physical_dimension",mxCreateString(sig[i].physical_dimension));
-            mxSetField(plhs[1],i,"physical_min",mxCreateDoubleScalar(sig[i].physical_min));
-            mxSetField(plhs[1],i,"physical_max",mxCreateDoubleScalar(sig[i].physical_max));
-            mxSetField(plhs[1],i,"digital_min",mxCreateDoubleScalar(sig[i].digital_min));
-            mxSetField(plhs[1],i,"digital_max",mxCreateDoubleScalar(sig[i].digital_max));
-            mxSetField(plhs[1],i,"samples_in_record",mxCreateDoubleScalar(sig[i].samples_in_record));
-            mxSetField(plhs[1],i,"sampling_frequency",mxCreateDoubleScalar(sig[i].sampling_frequency));
+            mxSetField(plhs[1],i,"signal_labels",
+                       mxCreateString(sig[i].signal_labels));
+            mxSetField(plhs[1],i,"transducer_type",
+                       mxCreateString(sig[i].transducer_type));
+            mxSetField(plhs[1],i,"physical_dimension",
+                       mxCreateString(sig[i].physical_dimension));
+            mxSetField(plhs[1],i,"physical_min",
+                       mxCreateDoubleScalar(sig[i].physical_min));
+            mxSetField(plhs[1],i,"physical_max",
+                       mxCreateDoubleScalar(sig[i].physical_max));
+            mxSetField(plhs[1],i,"digital_min",
+                       mxCreateDoubleScalar(sig[i].digital_min));
+            mxSetField(plhs[1],i,"digital_max",
+                       mxCreateDoubleScalar(sig[i].digital_max));
+            mxSetField(plhs[1],i,"samples_in_record",
+                       mxCreateDoubleScalar(sig[i].samples_in_record));
+            mxSetField(plhs[1],i,"sampling_frequency",
+                       mxCreateDoubleScalar(sig[i].sampling_frequency));
         }
     }
 
-    /* ===================== Signal Data Output ===================== */
-    if (nlhs>=3 && raw!=NULL) {
+    /* ============================================================
+    *                       SIGNAL DATA OUTPUT
+    * ============================================================ */
+
+    if (nlhs>=3 && raw!=NULL)
+    {
+        DBG("\n===== OUTPUT LOOP =====\n");
+        DBG("num_data_records: %d\n", hdr.num_data_records);
+        DBG("=======================\n\n");
+
+        ASSERT(hdr.num_data_records > 0);
+
         plhs[2]=mxCreateCellMatrix(1,hdr.num_signals);
+
         mwSize offset=0;
-        for (int s=0;s<hdr.num_signals;s++) {
+
+        for (int s=0;s<hdr.num_signals;s++)
+        {
             mwSize spr=sig[s].samples_in_record;
             mwSize len=spr*hdr.num_data_records;
+
+            DBG("Signal %d output length: %llu\n",
+                s,(unsigned long long)len);
+
+            ASSERT(len > 0);
+            ASSERT(sig[s].digital_max != sig[s].digital_min);
+
             mxArray *v=mxCreateDoubleMatrix(1,len,mxREAL);
             double *out=mxGetPr(v);
 
             double scale=(sig[s].physical_max-sig[s].physical_min) /
                 (sig[s].digital_max-sig[s].digital_min);
-            double offs=sig[s].physical_min - sig[s].digital_min*scale;
+
+            double offs=sig[s].physical_min -
+                sig[s].digital_min*scale;
 
             mwSize out_i=0;
-            for (mwSize r=0;r<hdr.num_data_records;r++) {
+
+            for (mwSize r=0;r<hdr.num_data_records;r++)
+            {
                 mwSize base=r*total_samp_per_rec + offset;
-                for (mwSize k=0;k<spr;k++) {
+
+                for (mwSize k=0;k<spr;k++)
+                {
                     mwSize idx=2*(base+k);
-                    int16_t vraw=(int16_t)(raw[idx] | (raw[idx+1]<<8));
+                    int16_t vraw=
+                        (int16_t)(raw[idx] |
+                        (raw[idx+1]<<8));
+
+                    if (g_debug && s==0 && r==0 && k<5)
+                        DBG("Raw[%llu]=%d\n",
+                            (unsigned long long)k,
+                            vraw);
+
                     out[out_i++]=vraw*scale+offs;
                 }
             }
+
             mxSetCell(plhs[2],s,v);
             offset+=spr;
         }
+
         mxFree(raw);
     }
 
-    /* ===================== Annotation Output ===================== */
-    if (nlhs>=4 && annot_idx>=0) {
+    /* ============================================================
+    *                     ANNOTATION OUTPUT
+    * ============================================================ */
+
+    if (nlhs>=4 && annot_idx>=0)
+    {
         const char *f[]={"onset","text"};
         mxArray *A = mxCreateStructMatrix(0,0,2,f);
 
         Annotation *alist = NULL;
         mwSize acount = 0;
-        for (mwSize r=0;r<hdr.num_data_records;r++) {
+
+        for (mwSize r=0;r<hdr.num_data_records;r++)
+        {
             mwSize byte_off = 0;
             for (int i=0;i<annot_idx;i++)
                 byte_off += sig[i].samples_in_record*2;
 
-            mwSize annot_bytes = sig[annot_idx].samples_in_record*2;
+            mwSize annot_bytes =
+                sig[annot_idx].samples_in_record*2;
+
             unsigned char *blk = mxMalloc(annot_bytes);
-            fseek(fid, hdr.num_header_bytes + r*bytes_per_rec + byte_off, SEEK_SET);
+
+            fseek(fid,
+                  hdr.num_header_bytes +
+                  r*bytes_per_rec +
+                  byte_off,
+                  SEEK_SET);
+
             fread(blk, 1, annot_bytes, fid);
-            parse_tal_block_fast(blk, annot_bytes, &alist, &acount);
+
+            parse_tal_block_fast(blk, annot_bytes,
+                                 &alist, &acount);
+
             mxFree(blk);
         }
 
@@ -378,10 +535,13 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
             mxDestroyArray(A);
             A = mxCreateStructMatrix(acount,1,2,f);
             for (mwSize i=0;i<acount;i++) {
-                mxSetField(A,i,"onset",mxCreateDoubleScalar(alist[i].onset));
-                mxSetField(A,i,"text",alist[i].texts);
+                mxSetField(A,i,"onset",
+                           mxCreateDoubleScalar(alist[i].onset));
+                mxSetField(A,i,"text",
+                           alist[i].texts);
             }
         }
+
         mxFree(alist);
         plhs[3] = A;
     }
