@@ -155,6 +155,9 @@ for f = 1:numel(sig_fields)
     end
 end
 
+new_signal_labels = cellfun(@deblank,{signal_header.signal_labels},'UniformOutput', false);
+[signal_header.signal_labels] = deal(new_signal_labels{:});
+
 %% ---------------- CHANNEL SELECTION ----------------
 labels = strtrim({signal_header.signal_labels});
 
