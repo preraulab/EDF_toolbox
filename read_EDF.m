@@ -73,34 +73,37 @@ mex_file = fullfile(script_dir, ['read_EDF_mex.' mexext]);
 mex_exists = isfile(mex_file);
 
 if ~force_matlab
-    if mex_exists
-        try
-            [varargout{1:nargout}] = read_EDF_mex(edf_fname, channels, epochs, verbose, repair_header, debug);
+    if ~mex_exists
+        disp('Compiling mex...')
+        mex read_EDF_mex.c -O -largeArrayDims;
+    end
+    try
+        [varargout{1:nargout}] = read_EDF_mex(edf_fname, channels, epochs, verbose, repair_header, debug);
 
-            if nargout>0
+        if nargout>0
             %Add the total data in seconds
-                total_seconds = varargout{1}.num_data_records * varargout{1}.data_record_duration;
-                varargout{1}.total_data_seconds = total_seconds;
-                varargout{1}.total_data_hms = char(duration(0,0,total_seconds));
-            end
+            total_seconds = varargout{1}.num_data_records * varargout{1}.data_record_duration;
+            varargout{1}.total_data_seconds = total_seconds;
+            varargout{1}.total_data_hms = char(duration(0,0,total_seconds));
+        end
 
-            %Remove the whitespace around the labels
-            if nargout>1
-                new_signal_labels = cellfun(@strip,{varargout{2}.signal_labels},'UniformOutput', false);
-                [varargout{2}.signal_labels] = deal(new_signal_labels{:});
-            end
+        %Remove the whitespace around the labels
+        if nargout>1
+            new_signal_labels = cellfun(@strip,{varargout{2}.signal_labels},'UniformOutput', false);
+            [varargout{2}.signal_labels] = deal(new_signal_labels{:});
+        end
 
-            % Deidentify post-MEX if requested (MEX does not handle this)
-            if deidentify
-                deidentify_edf(edf_fname, repair_header, verbose);
-            end
-            return
-        catch ME
-            if verbose
-                fprintf('MEX failed (%s). Falling back to MATLAB reader.\n', ME.message);
-            end
+        % Deidentify post-MEX if requested (MEX does not handle this)
+        if deidentify
+            deidentify_edf(edf_fname, repair_header, verbose);
+        end
+        return
+    catch ME
+        if verbose
+            fprintf('MEX failed (%s). Falling back to MATLAB reader.\n', ME.message);
         end
     end
+
 else
     if verbose
         fprintf('forceMATLAB = true, using MATLAB reader.\n');
