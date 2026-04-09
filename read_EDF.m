@@ -12,6 +12,7 @@ function varargout = read_EDF(edf_fname, varargin)
 %   Inputs:
 %       edf_fname      : string - EDF or EDF+ file path
 %       'Channels'     : cell array - subset of channels to read (default: all)
+%                        Use 'ChA-ChB' to load ChA minus ChB as a rereferenced channel.
 %       'Epochs'       : 1x2 vector [start_epoch end_epoch] (0-indexed, default: all)
 %       'Verbose'      : logical - print progress and status info (default: false)
 %       'RepairHeader' : logical - correct invalid record counts and save with _fixed suffix (default: false)
@@ -91,23 +92,6 @@ if ~force_matlab
         if nargout>1
             new_signal_labels = cellfun(@strip,{varargout{2}.signal_labels},'UniformOutput', false);
             [varargout{2}.signal_labels] = deal(new_signal_labels{:});
-        end
-
-        % Apply channel filtering and rereferencing (MEX always loads all channels)
-        if nargout >= 2 && ~isempty(channels)
-            all_labels = {varargout{2}.signal_labels};
-            [plain_chs, reref_pairs] = parse_reref_requests(channels, all_labels);
-            if nargout >= 3
-                [varargout{2}, varargout{3}] = apply_reref_filter(varargout{2}, varargout{3}, all_labels, plain_chs, reref_pairs);
-            else
-                all_labels_lower = lower(cellfun(@strtrim, all_labels, 'UniformOutput', false));
-                if ~isempty(plain_chs)
-                    plain_idx = find(ismember(all_labels_lower, lower(cellfun(@strtrim, plain_chs, 'UniformOutput', false))));
-                else
-                    plain_idx = [];
-                end
-                varargout{2} = varargout{2}(plain_idx);
-            end
         end
 
         % Deidentify post-MEX if requested (MEX does not handle this)
@@ -192,28 +176,20 @@ end
 new_signal_labels = cellfun(@strip,{signal_header.signal_labels},'UniformOutput', false);
 [signal_header.signal_labels] = deal(new_signal_labels{:});
 
-%% ---------------- CHANNEL SELECTION ----------------
-labels = strip({signal_header.signal_labels});
-reref_plain_chs = {};
-reref_pairs     = {};
+%% ---------------- CHANNEL PLAN ----------------
+% Inspect all requested channels. Identify plain channel requests and A-B
+% rereference pairs. Determine the superset of raw signals to decode.
+all_labels = {signal_header.signal_labels};
 
 if isempty(channels)
     signal_indices = 1:num_signals;
+    plain_chs   = {};
+    reref_pairs = {};
 else
-    [reref_plain_chs, reref_pairs] = parse_reref_requests(channels, labels);
-    % Collect constituent channels needed for rereferencing
-    constituent_chs = {};
-    for k = 1:numel(reref_pairs)
-        constituent_chs{end+1} = reref_pairs{k}{1};
-        constituent_chs{end+1} = reref_pairs{k}{2};
-    end
-    all_needed = unique([reref_plain_chs(:)', constituent_chs(:)'], 'stable');
-    if isempty(all_needed)
-        error('No valid channels found.');
-    end
-    signal_indices = find(ismember(lower(labels), lower(strtrim(all_needed))));
+    [plain_chs, reref_pairs, load_labels] = parse_channel_plan(channels, all_labels);
+    signal_indices = find(ismember(lower(all_labels), lower(load_labels)));
     if isempty(signal_indices)
-        error('No valid channels found.');
+        error('read_EDF:NoChannels', 'No valid channels found.');
     end
 end
 
@@ -291,7 +267,8 @@ for ii = 1:length(signal_header)
 end
 
 %% ---------------- DIGITAL TO PHYSICAL ----------------
-signal_cells = cell(1,length(signal_indices));
+% Decode only the channels in signal_indices (plain + reref constituents).
+signal_cells = cell(1, length(signal_indices));
 
 for i = 1:length(signal_indices)
 
@@ -300,7 +277,7 @@ for i = 1:length(signal_indices)
     samples_per_epoch = samples_per_record(sidx);
     total_samples = samples_per_epoch * num_epochs;
 
-    sig = zeros(1,total_samples);
+    sig = zeros(1, total_samples);
 
     dig_min = signal_header(sidx).digital_min;
     dig_max = signal_header(sidx).digital_max;
@@ -323,12 +300,14 @@ for i = 1:length(signal_indices)
 
 end
 
+% Trim signal_header to only the loaded subset (signal_cells{i} <-> signal_header(i)).
 signal_header = signal_header(signal_indices);
 
-% Apply rereferencing if requested
-if ~isempty(reref_pairs)
-    loaded_labels = {signal_header.signal_labels};
-    [signal_header, signal_cells] = apply_reref_filter(signal_header, signal_cells, loaded_labels, reref_plain_chs, reref_pairs);
+%% ---------------- REREFERENCING ----------------
+% Compute A-B difference signals and remove any constituent channels that
+% were not independently requested.
+if ~isempty(channels)
+    [signal_header, signal_cells] = apply_channel_plan(signal_header, signal_cells, plain_chs, reref_pairs);
 end
 
 annotations = extractAnnotations(edf_fname, header, signal_header);
@@ -353,24 +332,36 @@ end
 
 
 %% =========================================================================
-%  PARSE REREFERENCING REQUESTS
+%  CHANNEL PLAN PARSER
 % =========================================================================
-function [plain_chs, reref_pairs] = parse_reref_requests(channels, all_labels)
-% Classify each entry in channels as a plain channel or an A-B reref pair.
-% A-B is treated as a rereference only when both A and B are valid channel
-% names in all_labels; otherwise the entry is passed through as a plain name.
+function [plain_chs, reref_pairs, load_labels] = parse_channel_plan(channels, all_labels)
+%PARSE_CHANNEL_PLAN  Classify requested channels as plain or A-B reref pairs.
+%
+%   For each entry in channels:
+%     - If it directly matches a label (case-insensitive) → plain channel.
+%     - Otherwise try each '-' as a split point. The first split where both
+%       sides are valid label names is treated as a rereference request.
+%     - Anything else is passed through as a plain name (will error on load).
+%
+%   Returns:
+%     plain_chs   : cell array of directly-requested channel name strings
+%     reref_pairs : cell array of {chA, chB, 'chA-chB'} rows
+%     load_labels : unique set of labels to actually decode (plain + constituents)
+
 all_labels_lower = lower(cellfun(@strtrim, all_labels, 'UniformOutput', false));
 plain_chs   = {};
 reref_pairs = {};
 
 for k = 1:numel(channels)
     ch = strtrim(channels{k});
-    % Direct match → plain channel
+
+    % Direct label match → plain channel
     if ismember(lower(ch), all_labels_lower)
         plain_chs{end+1} = ch;
         continue;
     end
-    % Try each '-' as a split point (leftmost first); keep first valid split
+
+    % Try each '-' as a split point, leftmost first
     dashes = strfind(ch, '-');
     found  = false;
     for d = dashes
@@ -384,40 +375,52 @@ for k = 1:numel(channels)
             break;
         end
     end
+
     if ~found
-        plain_chs{end+1} = ch;   % pass through; will error naturally if invalid
+        plain_chs{end+1} = ch;  % unknown; will produce an error on lookup
     end
 end
+
+% Superset of labels to decode = plain channels + both sides of every reref pair
+load_labels = plain_chs;
+for k = 1:numel(reref_pairs)
+    load_labels{end+1} = reref_pairs{k}{1};
+    load_labels{end+1} = reref_pairs{k}{2};
+end
+load_labels = unique(load_labels, 'stable');
 end
 
 
 %% =========================================================================
-%  APPLY REREFERENCING FILTER
+%  APPLY CHANNEL PLAN
 % =========================================================================
-function [sh_out, sc_out] = apply_reref_filter(signal_header, signal_cell, all_labels, plain_chs, reref_pairs)
-% Filter signal_header/signal_cell to the explicitly requested plain channels,
-% then append one entry per A-B rereference pair (signal A minus signal B).
-% Constituent channels that were only needed for rereferencing are removed.
-all_labels_lower = lower(cellfun(@strtrim, all_labels, 'UniformOutput', false));
+function [sh_out, sc_out] = apply_channel_plan(signal_header, signal_cell, plain_chs, reref_pairs)
+%APPLY_CHANNEL_PLAN  Filter to requested channels and compute A-B reref signals.
+%
+%   signal_header / signal_cell contain the loaded superset (plain + constituents).
+%   Output keeps only the explicitly requested plain channels, then appends one
+%   entry per reref pair. Constituent-only channels are dropped.
 
-% Indices of plain channels in the loaded data
-if isempty(plain_chs)
-    plain_idx = [];
-else
-    plain_idx = find(ismember(all_labels_lower, lower(cellfun(@strtrim, plain_chs, 'UniformOutput', false))));
+labels = {signal_header.signal_labels};
+
+% Indices of plain channels in the loaded data (preserve request order)
+plain_idx = zeros(1, numel(plain_chs));
+for k = 1:numel(plain_chs)
+    plain_idx(k) = find(strcmpi(labels, strtrim(plain_chs{k})), 1);
 end
+plain_idx = plain_idx(plain_idx > 0);
 
 % Compute rereferenced signals
 n = numel(reref_pairs);
 reref_sc = cell(1, n);
 if n > 0
-    reref_sh(1:n) = signal_header(1);   % preallocate with correct struct fields
+    reref_sh(1:n) = signal_header(1);   % preallocate with matching struct fields
     for k = 1:n
         chA  = reref_pairs{k}{1};
         chB  = reref_pairs{k}{2};
         name = reref_pairs{k}{3};
-        idxA = find(strcmpi(all_labels, chA), 1);
-        idxB = find(strcmpi(all_labels, chB), 1);
+        idxA = find(strcmpi(labels, chA), 1);
+        idxB = find(strcmpi(labels, chB), 1);
         reref_sh(k)               = signal_header(idxA);
         reref_sh(k).signal_labels = name;
         reref_sc{k}               = signal_cell{idxA} - signal_cell{idxB};

@@ -11,7 +11,8 @@
  *       • Per-signal header parsing
  *       • Automatic correction of invalid num_data_records
  *       • Digital → physical unit conversion
- *       • Multi-channel extraction
+ *       • Multi-channel extraction with optional subset selection
+ *       • A-B rereferencing (e.g. 'EEG C3-A2')
  *       • EDF+ annotation (TAL) parsing
  *       • Optional on-disk header repair
  *       • Extensive debug instrumentation (when enabled)
@@ -34,7 +35,9 @@
  *       filename  : string
  *
  *   Optional:
- *       channels  : (currently unused placeholder)
+ *       channels  : cell array of channel name strings
+ *                   Use 'ChA-ChB' for a rereferenced channel.
+ *                   Empty cell {} or omitted → load all channels.
  *       epochs    : (currently unused placeholder)
  *       verbose   : logical (prints header repair info)
  *       repair    : logical (rewrite corrected record count to disk)
@@ -55,7 +58,7 @@
  *       data_record_duration
  *       num_signals
  *
- *   sigheader   : 1xN struct array (per signal)
+ *   sigheader   : 1xN struct array (per output signal/channel)
  *       signal_labels
  *       transducer_type
  *       physical_dimension
@@ -70,10 +73,29 @@
  *   data        : 1xN cell array
  *       Each cell contains a 1x(total_samples) double vector
  *       converted to physical units.
+ *       For rereferenced channels the cell contains sigA - sigB.
  *
  *   annotations : struct array (EDF+ only)
  *       onset   : double (seconds)
  *       text    : 1xM cell array of annotation strings
+ *
+ * -------------------------------------------------------------------------
+ * CHANNEL SELECTION AND REREFERENCING
+ * -------------------------------------------------------------------------
+ *
+ *   When the channels cell array is non-empty:
+ *
+ *     • Plain channels  : must match a signal_label exactly
+ *                         (case-insensitive, whitespace-trimmed)
+ *     • Reref channels  : 'ChA-ChB' — tries each '-' as a split point,
+ *                         leftmost first. Both sides must be valid labels.
+ *                         Output = physical(ChA) - physical(ChB).
+ *                         The output channel inherits ChA's header and
+ *                         carries the label 'ChA-ChB'.
+ *
+ *   Only channels in the channels list appear in sigheader / data.
+ *   Constituent-only signals (needed for subtraction but not requested
+ *   directly) are loaded internally but excluded from the output.
  *
  * -------------------------------------------------------------------------
  * DIGITAL → PHYSICAL CONVERSION
@@ -140,24 +162,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 
 #if defined(MX_COMPAT_32)
 #error "This MEX requires -largeArrayDims"
 #endif
 
 #define EDF_HEADER_SIZE 256
+#define MAX_LABEL_LEN   17   /* 16 chars + NUL */
+#define MAX_CHANNELS    512
 
 /* ============================================================
-*                         DEBUG MACROS
-* ============================================================ */
+ *                         DEBUG MACROS
+ * ============================================================ */
 static int g_debug = 0;
 #define DBG(...) do { if (g_debug) mexPrintf(__VA_ARGS__); } while (0)
 #define ASSERT(cond) \
-do { if (g_debug && !(cond)) mexErrMsgIdAndTxt("read_EDF_mex:Assert", #cond); } while (0)
+    do { if (g_debug && !(cond)) mexErrMsgIdAndTxt("read_EDF_mex:Assert", #cond); } while (0)
 
 /* ============================================================
-*                         STRUCTS
-* ============================================================ */
+ *                         STRUCTS
+ * ============================================================ */
 
 typedef struct {
     char edf_ver[9];
@@ -172,7 +197,7 @@ typedef struct {
 } EDF_Header;
 
 typedef struct {
-    char signal_labels[17];
+    char signal_labels[MAX_LABEL_LEN];
     char transducer_type[81];
     char physical_dimension[9];
     double physical_min, physical_max;
@@ -188,62 +213,100 @@ typedef struct {
 } Annotation;
 
 /* ============================================================
-*                         UTILITIES
-* ============================================================ */
+ *                  CHANNEL PLAN STRUCTS
+ * ============================================================ */
 
-static void trim_string(char *s) {
+/* Describes one entry in the user's channel request list. */
+typedef enum { CH_PLAIN, CH_REREF } ChannelKind;
+
+typedef struct {
+    ChannelKind kind;
+    char label[64];          /* output label (plain name or "ChA-ChB")  */
+    int  raw_idx_a;          /* index into sig[] for ChA (or plain ch)  */
+    int  raw_idx_b;          /* index into sig[] for ChB (-1 if plain)  */
+} ChannelPlan;
+
+/* ============================================================
+ *                         UTILITIES
+ * ============================================================ */
+
+static void trim_string(char *s)
+{
     char *p = s;
     while (*p == ' ') p++;
     memmove(s, p, strlen(p) + 1);
     size_t n = strlen(s);
-    while (n && s[n-1] == ' ') s[--n] = 0;
+    while (n && s[n-1] == ' ') s[--n] = '\0';
+}
+
+/* Case-insensitive strcmp */
+static int ci_strcmp(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 1;
+        a++; b++;
+    }
+    return (*a != *b);
+}
+
+/* Find signal index by label (case-insensitive, trimmed).
+ * Returns -1 if not found. */
+static int find_signal(const Signal_Header *sig, int nsig, const char *name)
+{
+    for (int i = 0; i < nsig; i++) {
+        if (ci_strcmp(sig[i].signal_labels, name) == 0)
+            return i;
+    }
+    return -1;
 }
 
 /* ============================================================
-*                         HEADER IO
-* ============================================================ */
+ *                         HEADER IO
+ * ============================================================ */
 
-static int read_edf_header(FILE *fid, EDF_Header *h) {
+static int read_edf_header(FILE *fid, EDF_Header *h)
+{
     unsigned char buf[EDF_HEADER_SIZE];
     char tmp[16];
 
     if (fread(buf, 1, EDF_HEADER_SIZE, fid) != EDF_HEADER_SIZE) return 0;
 
-    memcpy(h->edf_ver, buf, 8); h->edf_ver[8] = 0; trim_string(h->edf_ver);
-    memcpy(h->patient_id, buf+8, 80); h->patient_id[80] = 0; trim_string(h->patient_id);
-    memcpy(h->local_rec_id, buf+88, 80); h->local_rec_id[80] = 0; trim_string(h->local_rec_id);
-    memcpy(h->recording_startdate, buf+168, 8); h->recording_startdate[8] = 0;
-    memcpy(h->recording_starttime, buf+176, 8); h->recording_starttime[8] = 0;
+    memcpy(h->edf_ver,             buf,     8); h->edf_ver[8]             = '\0'; trim_string(h->edf_ver);
+    memcpy(h->patient_id,          buf+8,  80); h->patient_id[80]         = '\0'; trim_string(h->patient_id);
+    memcpy(h->local_rec_id,        buf+88, 80); h->local_rec_id[80]       = '\0'; trim_string(h->local_rec_id);
+    memcpy(h->recording_startdate, buf+168, 8); h->recording_startdate[8] = '\0';
+    memcpy(h->recording_starttime, buf+176, 8); h->recording_starttime[8] = '\0';
 
-    memcpy(tmp, buf+184, 8); tmp[8]=0; h->num_header_bytes = atoi(tmp);
-    memcpy(tmp, buf+236, 8); tmp[8]=0; h->num_data_records = atoi(tmp);
-    memcpy(tmp, buf+244, 8); tmp[8]=0; h->data_record_duration = atof(tmp);
-    memcpy(tmp, buf+252, 4); tmp[4]=0; h->num_signals = atoi(tmp);
+    memcpy(tmp, buf+184, 8); tmp[8]='\0'; h->num_header_bytes      = atoi(tmp);
+    memcpy(tmp, buf+236, 8); tmp[8]='\0'; h->num_data_records      = atoi(tmp);
+    memcpy(tmp, buf+244, 8); tmp[8]='\0'; h->data_record_duration  = atof(tmp);
+    memcpy(tmp, buf+252, 4); tmp[4]='\0'; h->num_signals           = atoi(tmp);
 
     return 1;
 }
 
-static int read_signal_headers(FILE *fid, Signal_Header *sh, int nsig) {
+static int read_signal_headers(FILE *fid, Signal_Header *sh, int nsig)
+{
     char tmp[16];
     int i;
 
-    for (i=0;i<nsig;i++) fread(sh[i].signal_labels,16,1,fid), sh[i].signal_labels[16]=0, trim_string(sh[i].signal_labels);
-    for (i=0;i<nsig;i++) fread(sh[i].transducer_type,80,1,fid), sh[i].transducer_type[80]=0, trim_string(sh[i].transducer_type);
-    for (i=0;i<nsig;i++) fread(sh[i].physical_dimension,8,1,fid), sh[i].physical_dimension[8]=0;
-    for (i=0;i<nsig;i++) fread(tmp,8,1,fid), tmp[8]=0, sh[i].physical_min=atof(tmp);
-    for (i=0;i<nsig;i++) fread(tmp,8,1,fid), tmp[8]=0, sh[i].physical_max=atof(tmp);
-    for (i=0;i<nsig;i++) fread(tmp,8,1,fid), tmp[8]=0, sh[i].digital_min=atof(tmp);
-    for (i=0;i<nsig;i++) fread(tmp,8,1,fid), tmp[8]=0, sh[i].digital_max=atof(tmp);
-    for (i=0;i<nsig;i++) fread(sh[i].prefiltering,80,1,fid), sh[i].prefiltering[80]=0;
-    for (i=0;i<nsig;i++) fread(tmp,8,1,fid), tmp[8]=0, sh[i].samples_in_record=atoi(tmp);
-    for (i=0;i<nsig;i++) fread(tmp,32,1,fid);
+    for (i=0;i<nsig;i++) { fread(sh[i].signal_labels,   16,1,fid); sh[i].signal_labels[16]  ='\0'; trim_string(sh[i].signal_labels);   }
+    for (i=0;i<nsig;i++) { fread(sh[i].transducer_type,  80,1,fid); sh[i].transducer_type[80] ='\0'; trim_string(sh[i].transducer_type); }
+    for (i=0;i<nsig;i++) { fread(sh[i].physical_dimension,8,1,fid); sh[i].physical_dimension[8]='\0'; }
+    for (i=0;i<nsig;i++) { fread(tmp,8,1,fid); tmp[8]='\0'; sh[i].physical_min=atof(tmp); }
+    for (i=0;i<nsig;i++) { fread(tmp,8,1,fid); tmp[8]='\0'; sh[i].physical_max=atof(tmp); }
+    for (i=0;i<nsig;i++) { fread(tmp,8,1,fid); tmp[8]='\0'; sh[i].digital_min =atof(tmp); }
+    for (i=0;i<nsig;i++) { fread(tmp,8,1,fid); tmp[8]='\0'; sh[i].digital_max =atof(tmp); }
+    for (i=0;i<nsig;i++) { fread(sh[i].prefiltering, 80,1,fid); sh[i].prefiltering[80]='\0'; }
+    for (i=0;i<nsig;i++) { fread(tmp,8,1,fid); tmp[8]='\0'; sh[i].samples_in_record=atoi(tmp); }
+    for (i=0;i<nsig;i++) { fread(tmp,32,1,fid); } /* reserved */
 
     return 1;
 }
 
 /* ============================================================
-*                 EDF+ num_data_records FIX
-* ============================================================ */
+ *                 EDF+ num_data_records FIX
+ * ============================================================ */
 
 static void fix_num_records(FILE *fid, EDF_Header *hdr,
                             Signal_Header *sig,
@@ -252,17 +315,13 @@ static void fix_num_records(FILE *fid, EDF_Header *hdr,
                             int repair)
 {
     mwSize total_samp_per_rec = 0;
-    for (int i=0;i<hdr->num_signals;i++)
+    for (int i = 0; i < hdr->num_signals; i++)
         total_samp_per_rec += sig[i].samples_in_record;
 
     DBG("\n===== DERIVED RECORD INFO =====\n");
-    DBG("Total samples per record: %llu\n",
-        (unsigned long long)total_samp_per_rec);
-
-    for (int i=0;i<hdr->num_signals;i++) {
-        DBG("Signal %d samples_in_record: %d\n",
-            i, sig[i].samples_in_record);
-    }
+    DBG("Total samples per record: %llu\n", (unsigned long long)total_samp_per_rec);
+    for (int i = 0; i < hdr->num_signals; i++)
+        DBG("Signal %d samples_in_record: %d\n", i, sig[i].samples_in_record);
     DBG("===============================\n\n");
 
     ASSERT(total_samp_per_rec > 0);
@@ -270,7 +329,7 @@ static void fix_num_records(FILE *fid, EDF_Header *hdr,
     mwSize bytes_per_rec = total_samp_per_rec * 2;
 
     fseek(fid, 0, SEEK_END);
-    mwSize fsize = ftell(fid);
+    mwSize fsize = (mwSize)ftell(fid);
     mwSize data_bytes = fsize - hdr->num_header_bytes;
 
     if (bytes_per_rec == 0) return;
@@ -282,21 +341,17 @@ static void fix_num_records(FILE *fid, EDF_Header *hdr,
     {
         if (verbose)
             mexPrintf("Updating num_data_records from %d to %llu\n",
-                      hdr->num_data_records,
-                      (unsigned long long)actual_records);
+                      hdr->num_data_records, (unsigned long long)actual_records);
 
         if (repair) {
             FILE *fw = fopen(fname, "r+b");
             if (fw) {
                 char rec_str[9];
-                snprintf(rec_str, 9, "%-8llu",
-                         (unsigned long long)actual_records);
+                snprintf(rec_str, 9, "%-8llu", (unsigned long long)actual_records);
                 fseek(fw, 236, SEEK_SET);
                 fwrite(rec_str, 1, 8, fw);
                 fclose(fw);
-
-                if (verbose)
-                    mexPrintf("Header repaired on disk.\n");
+                if (verbose) mexPrintf("Header repaired on disk.\n");
             }
         }
 
@@ -307,13 +362,13 @@ static void fix_num_records(FILE *fid, EDF_Header *hdr,
 }
 
 /* ============================================================
-*                   EDF+ ANNOTATION PARSER
-* ============================================================ */
+ *                   EDF+ ANNOTATION PARSER
+ * ============================================================ */
 
 static void parse_tal_block_fast(
     const unsigned char *buf, mwSize len,
-    Annotation **out, mwSize *count
-    ) {
+    Annotation **out, mwSize *count)
+{
     mwSize i = 0;
 
     while (i < len) {
@@ -326,7 +381,7 @@ static void parse_tal_block_fast(
         mwSize j = 0;
         while (i < len && buf[i] != 20 && j < sizeof(onset_str)-1)
             onset_str[j++] = buf[i++];
-        onset_str[j] = 0;
+        onset_str[j] = '\0';
         if (i >= len) break;
         i++; /* skip 0x14 */
 
@@ -338,7 +393,7 @@ static void parse_tal_block_fast(
             mwSize k = 0;
             while (i < len && buf[i] != 20 && buf[i] != 0 && k < sizeof(txt)-1)
                 txt[k++] = buf[i++];
-            txt[k] = 0;
+            txt[k] = '\0';
 
             if (k > 0) {
                 texts = mxRealloc(texts, (ntext+1)*sizeof(char*));
@@ -371,36 +426,146 @@ static void parse_tal_block_fast(
 }
 
 /* ============================================================
-*                         MEX ENTRY
-* ============================================================ */
+ *                   CHANNEL PLAN BUILDER
+ * ============================================================ */
+
+/*  Parse the user-supplied channels cell array and build a ChannelPlan[].
+ *
+ *  Rules (mirror the MATLAB parse_channel_plan / apply_channel_plan logic):
+ *    1. If a requested name matches a file label exactly (ci)  →  plain.
+ *    2. Otherwise try each '-' as a split; if both sides are valid labels
+ *       take the leftmost valid split  →  reref.
+ *    3. Unknown names are kept as plain (will later fail at find_signal).
+ *
+ *  Returns the number of plan entries, and also fills need_raw[0..nsig-1]
+ *  to indicate which raw signals must actually be decoded.
+ */
+static int build_channel_plan(const mxArray *ch_cell,
+                              const Signal_Header *sig, int nsig,
+                              ChannelPlan *plan,          /* out, preallocated */
+                              int *need_raw)              /* out, preallocated, zero-initialised */
+{
+    mwSize nchan = mxGetNumberOfElements(ch_cell);
+    int nplan = 0;
+
+    for (mwSize c = 0; c < nchan; c++) {
+        mxArray *elem = mxGetCell(ch_cell, c);
+        if (!elem) continue;
+
+        char req[64];
+        mxGetString(elem, req, sizeof(req));
+        /* trim */
+        {
+            char *p = req;
+            while (*p == ' ') p++;
+            memmove(req, p, strlen(p)+1);
+            size_t n = strlen(req);
+            while (n && req[n-1]==' ') req[--n]='\0';
+        }
+        if (req[0] == '\0') continue;
+
+        /* --- 1. Direct label match? --- */
+        int idx = find_signal(sig, nsig, req);
+        if (idx >= 0) {
+            plan[nplan].kind       = CH_PLAIN;
+            plan[nplan].raw_idx_a  = idx;
+            plan[nplan].raw_idx_b  = -1;
+            strncpy(plan[nplan].label, req, sizeof(plan[nplan].label)-1);
+            plan[nplan].label[sizeof(plan[nplan].label)-1] = '\0';
+            need_raw[idx] = 1;
+            nplan++;
+            continue;
+        }
+
+        /* --- 2. Try each '-' as A-B split, leftmost first --- */
+        int found_reref = 0;
+        size_t req_len = strlen(req);
+        for (size_t d = 1; d < req_len; d++) {
+            if (req[d] != '-') continue;
+
+            char chA[64], chB[64];
+            size_t la = d;
+            size_t lb = req_len - d - 1;
+            if (la == 0 || lb == 0) continue;
+
+            strncpy(chA, req,     la); chA[la] = '\0';
+            strncpy(chB, req+d+1, lb); chB[lb] = '\0';
+
+            /* trim chA / chB */
+            {
+                char *p = chA; while(*p==' ')p++; memmove(chA,p,strlen(p)+1);
+                size_t n=strlen(chA); while(n&&chA[n-1]==' ')chA[--n]='\0';
+                p = chB; while(*p==' ')p++; memmove(chB,p,strlen(p)+1);
+                n=strlen(chB); while(n&&chB[n-1]==' ')chB[--n]='\0';
+            }
+
+            int ia = find_signal(sig, nsig, chA);
+            int ib = find_signal(sig, nsig, chB);
+
+            if (ia >= 0 && ib >= 0) {
+                plan[nplan].kind       = CH_REREF;
+                plan[nplan].raw_idx_a  = ia;
+                plan[nplan].raw_idx_b  = ib;
+                strncpy(plan[nplan].label, req, sizeof(plan[nplan].label)-1);
+                plan[nplan].label[sizeof(plan[nplan].label)-1] = '\0';
+                need_raw[ia] = 1;
+                need_raw[ib] = 1;
+                nplan++;
+                found_reref = 1;
+                break;
+            }
+        }
+
+        if (!found_reref) {
+            /* Unknown channel – pass through as plain; will error later if absent */
+            plan[nplan].kind      = CH_PLAIN;
+            plan[nplan].raw_idx_a = -1;
+            plan[nplan].raw_idx_b = -1;
+            strncpy(plan[nplan].label, req, sizeof(plan[nplan].label)-1);
+            plan[nplan].label[sizeof(plan[nplan].label)-1] = '\0';
+            nplan++;
+        }
+    }
+
+    return nplan;
+}
+
+/* ============================================================
+ *                         MEX ENTRY
+ * ============================================================ */
 
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 {
     if (nrhs < 1)
-        mexErrMsgIdAndTxt("read_EDF_mex:Input","Filename required");
+        mexErrMsgIdAndTxt("read_EDF_mex:Input", "Filename required");
 
-    int verbose = (nrhs>3 && mxGetScalar(prhs[3])!=0);
-    g_debug     = (nrhs>5 && mxGetScalar(prhs[5])!=0);
+    int verbose = (nrhs > 3 && mxGetScalar(prhs[3]) != 0);
+    g_debug     = (nrhs > 5 && mxGetScalar(prhs[5]) != 0);
 
     char fname[4096];
     mxGetString(prhs[0], fname, sizeof(fname));
 
-    FILE *fid = fopen(fname,"rb");
-    if (!fid) mexErrMsgIdAndTxt("read_EDF_mex:File","Cannot open file");
+    /* --- Has the caller supplied a non-empty channels cell? --- */
+    int use_channel_plan = 0;
+    if (nrhs > 1 && mxIsCell(prhs[1]) && mxGetNumberOfElements(prhs[1]) > 0)
+        use_channel_plan = 1;
+
+    FILE *fid = fopen(fname, "rb");
+    if (!fid) mexErrMsgIdAndTxt("read_EDF_mex:File", "Cannot open file");
 
     /* ============================================================
-    *                         READ MAIN HEADER
-    * ============================================================ */
+     *                       READ MAIN HEADER
+     * ============================================================ */
 
     EDF_Header hdr;
-    if (!read_edf_header(fid,&hdr))
-        mexErrMsgIdAndTxt("read_EDF_mex:Header","Invalid EDF header");
+    if (!read_edf_header(fid, &hdr))
+        mexErrMsgIdAndTxt("read_EDF_mex:Header", "Invalid EDF header");
 
     DBG("\n===== EDF MAIN HEADER =====\n");
-    DBG("Header bytes: %d\n", hdr.num_header_bytes);
+    DBG("Header bytes: %d\n",           hdr.num_header_bytes);
     DBG("Num data records (header): %d\n", hdr.num_data_records);
-    DBG("Record duration: %.6f\n", hdr.data_record_duration);
-    DBG("Num signals: %d\n", hdr.num_signals);
+    DBG("Record duration: %.6f\n",      hdr.data_record_duration);
+    DBG("Num signals: %d\n",            hdr.num_signals);
     DBG("===========================\n\n");
 
     ASSERT(hdr.num_signals > 0);
@@ -408,264 +573,350 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     ASSERT(hdr.data_record_duration > 0);
 
     /* ============================================================
-    *                       READ SIGNAL HEADERS
-    * ============================================================ */
+     *                     READ SIGNAL HEADERS
+     * ============================================================ */
 
-    Signal_Header *sig = mxCalloc(hdr.num_signals,sizeof(Signal_Header));
-    read_signal_headers(fid,sig,hdr.num_signals);
+    Signal_Header *sig = mxCalloc(hdr.num_signals, sizeof(Signal_Header));
+    read_signal_headers(fid, sig, hdr.num_signals);
 
     mwSize total_samp_per_rec = 0;
     int annot_idx = -1;
 
     DBG("\n===== SIGNAL HEADERS =====\n");
-
-    for (int i=0;i<hdr.num_signals;i++) {
+    for (int i = 0; i < hdr.num_signals; i++) {
         sig[i].sampling_frequency =
             sig[i].samples_in_record / hdr.data_record_duration;
-
         total_samp_per_rec += sig[i].samples_in_record;
 
-        DBG("Signal %d: %s\n", i, sig[i].signal_labels);
-        DBG("  samples/record: %d\n", sig[i].samples_in_record);
-        DBG("  digital min/max: %f / %f\n",
-            sig[i].digital_min, sig[i].digital_max);
+        DBG("Signal %d: %s\n",           i, sig[i].signal_labels);
+        DBG("  samples/record: %d\n",    sig[i].samples_in_record);
+        DBG("  digital min/max: %f / %f\n", sig[i].digital_min, sig[i].digital_max);
 
-        if (strcmp(sig[i].signal_labels,"EDF Annotations")==0)
+        if (strcmp(sig[i].signal_labels, "EDF Annotations") == 0)
             annot_idx = i;
     }
-
-    DBG("Total samples per record: %llu\n",
-        (unsigned long long)total_samp_per_rec);
+    DBG("Total samples per record: %llu\n", (unsigned long long)total_samp_per_rec);
     DBG("===========================\n\n");
 
     ASSERT(total_samp_per_rec > 0);
 
     /* ============================================================
-    *                 FIX EDF+ num_data_records
-    * ============================================================ */
+     *                 FIX EDF+ num_data_records
+     * ============================================================ */
 
-    int repair = (nrhs>4 && mxGetScalar(prhs[4])!=0);
+    int repair = (nrhs > 4 && mxGetScalar(prhs[4]) != 0);
     fix_num_records(fid, &hdr, sig, fname, verbose, repair);
 
     mwSize bytes_per_rec = total_samp_per_rec * 2;
 
     /* ============================================================
-    *                 READ RAW DATA (if requested)
-    * ============================================================ */
+     *                   BUILD CHANNEL PLAN
+     * ============================================================ */
 
-    unsigned char *raw = NULL;
-    mwSize data_bytes = 0;
+    /* need_raw[i] == 1  →  signal i must be decoded from disk */
+    int *need_raw = mxCalloc(hdr.num_signals, sizeof(int));
 
-    if (nlhs >= 3)
-    {
-        fseek(fid,0,SEEK_END);
-        mwSize fsize = ftell(fid);
-        data_bytes = fsize - hdr.num_header_bytes;
+    ChannelPlan *plan = NULL;
+    int nplan = 0;
+
+    if (use_channel_plan) {
+        plan = mxMalloc(mxGetNumberOfElements(prhs[1]) * sizeof(ChannelPlan));
+        nplan = build_channel_plan(prhs[1], sig, hdr.num_signals, plan, need_raw);
+
+        if (nplan == 0)
+            mexErrMsgIdAndTxt("read_EDF_mex:NoChannels",
+                              "No valid channels found in the channel list.");
+
+        DBG("\n===== CHANNEL PLAN =====\n");
+        for (int p = 0; p < nplan; p++) {
+            if (plan[p].kind == CH_PLAIN)
+                DBG("  PLAIN  [%d]  %s\n", plan[p].raw_idx_a, plan[p].label);
+            else
+                DBG("  REREF  [%d]-[%d]  %s\n",
+                    plan[p].raw_idx_a, plan[p].raw_idx_b, plan[p].label);
+        }
+        DBG("========================\n\n");
+    } else {
+        /* All signals */
+        for (int i = 0; i < hdr.num_signals; i++)
+            need_raw[i] = 1;
+    }
+
+    /* ============================================================
+     *                 READ RAW DATA (if requested)
+     * ============================================================ */
+
+    /*
+     * raw_signals[i] – decoded physical-unit array for signal i,
+     *                  only allocated when need_raw[i] == 1.
+     */
+    double **raw_signals = NULL;
+    mwSize  *sig_lengths  = NULL;
+
+    if (nlhs >= 3) {
+        raw_signals = mxCalloc(hdr.num_signals, sizeof(double *));
+        sig_lengths  = mxCalloc(hdr.num_signals, sizeof(mwSize));
+
+        /* Read the entire data section once into a byte buffer */
+        fseek(fid, 0, SEEK_END);
+        mwSize fsize      = (mwSize)ftell(fid);
+        mwSize data_bytes = fsize - hdr.num_header_bytes;
 
         DBG("\n===== FILE SIZE CHECK =====\n");
-        DBG("File size: %llu\n", (unsigned long long)fsize);
-        DBG("Header bytes: %d\n", hdr.num_header_bytes);
-        DBG("Data bytes: %llu\n", (unsigned long long)data_bytes);
-        DBG("Bytes per record: %llu\n",
-            (unsigned long long)bytes_per_rec);
-        DBG("Expected data bytes: %llu\n",
-            (unsigned long long)
-            ((mwSize)hdr.num_data_records * bytes_per_rec));
+        DBG("File size: %llu\n",     (unsigned long long)fsize);
+        DBG("Header bytes: %d\n",    hdr.num_header_bytes);
+        DBG("Data bytes: %llu\n",    (unsigned long long)data_bytes);
+        DBG("Bytes per record: %llu\n", (unsigned long long)bytes_per_rec);
         DBG("===========================\n\n");
 
         ASSERT(bytes_per_rec > 0);
-        ASSERT(data_bytes > 0);
+        ASSERT(data_bytes    > 0);
 
-        raw = mxMalloc(data_bytes);
+        unsigned char *raw = mxMalloc(data_bytes);
+        fseek(fid, hdr.num_header_bytes, SEEK_SET);
+        size_t nread = fread(raw, 1, data_bytes, fid);
 
-        fseek(fid,hdr.num_header_bytes,SEEK_SET);
-        size_t nread = fread(raw,1,data_bytes,fid);
-
-        DBG("fread requested: %llu\n",
-            (unsigned long long)data_bytes);
-        DBG("fread returned:  %llu\n",
-            (unsigned long long)nread);
-
+        DBG("fread requested: %llu\n", (unsigned long long)data_bytes);
+        DBG("fread returned:  %llu\n", (unsigned long long)nread);
         ASSERT(nread == data_bytes);
-    }
 
-    /* ============================================================
-    *                         HEADER OUTPUT
-    * ============================================================ */
-
-    if (nlhs>=1) {
-        const char *f[]={"edf_ver","patient_id","local_rec_id",
-                         "recording_startdate","recording_starttime",
-                         "num_header_bytes","num_data_records",
-                         "data_record_duration","num_signals"};
-
-        plhs[0]=mxCreateStructMatrix(1,1,9,f);
-
-        mxSetField(plhs[0],0,"edf_ver",
-                   mxCreateString(hdr.edf_ver));
-        mxSetField(plhs[0],0,"patient_id",
-                   mxCreateString(hdr.patient_id));
-        mxSetField(plhs[0],0,"local_rec_id",
-                   mxCreateString(hdr.local_rec_id));
-        mxSetField(plhs[0],0,"recording_startdate",
-                   mxCreateString(hdr.recording_startdate));
-        mxSetField(plhs[0],0,"recording_starttime",
-                   mxCreateString(hdr.recording_starttime));
-        mxSetField(plhs[0],0,"num_header_bytes",
-                   mxCreateDoubleScalar(hdr.num_header_bytes));
-        mxSetField(plhs[0],0,"num_data_records",
-                   mxCreateDoubleScalar((double)hdr.num_data_records));
-        mxSetField(plhs[0],0,"data_record_duration",
-                   mxCreateDoubleScalar(hdr.data_record_duration));
-        mxSetField(plhs[0],0,"num_signals",
-                   mxCreateDoubleScalar(hdr.num_signals));
-    }
-
-    /* ============================================================
-    *                     SIGNAL HEADER OUTPUT
-    * ============================================================ */
-
-    if (nlhs>=2) {
-        const char *f[]={"signal_labels","transducer_type",
-                         "physical_dimension","physical_min",
-                         "physical_max","digital_min",
-                         "digital_max","prefiltering",
-                         "samples_in_record","sampling_frequency"};
-
-        plhs[1]=mxCreateStructMatrix(1,hdr.num_signals,10,f);
-
-        for (int i=0;i<hdr.num_signals;i++) {
-            mxSetField(plhs[1],i,"signal_labels",
-                       mxCreateString(sig[i].signal_labels));
-            mxSetField(plhs[1],i,"transducer_type",
-                       mxCreateString(sig[i].transducer_type));
-            mxSetField(plhs[1],i,"physical_dimension",
-                       mxCreateString(sig[i].physical_dimension));
-            mxSetField(plhs[1],i,"physical_min",
-                       mxCreateDoubleScalar(sig[i].physical_min));
-            mxSetField(plhs[1],i,"physical_max",
-                       mxCreateDoubleScalar(sig[i].physical_max));
-            mxSetField(plhs[1],i,"digital_min",
-                       mxCreateDoubleScalar(sig[i].digital_min));
-            mxSetField(plhs[1],i,"digital_max",
-                       mxCreateDoubleScalar(sig[i].digital_max));
-            mxSetField(plhs[1],i,"samples_in_record",
-                       mxCreateDoubleScalar(sig[i].samples_in_record));
-            mxSetField(plhs[1],i,"sampling_frequency",
-                       mxCreateDoubleScalar(sig[i].sampling_frequency));
+        /* Per-signal offset (in samples) within each record */
+        mwSize *sig_offset = mxMalloc(hdr.num_signals * sizeof(mwSize));
+        mwSize acc = 0;
+        for (int s = 0; s < hdr.num_signals; s++) {
+            sig_offset[s] = acc;
+            acc += sig[s].samples_in_record;
         }
-    }
 
-    /* ============================================================
-    *                       SIGNAL DATA OUTPUT
-    * ============================================================ */
+        DBG("\n===== DECODING SIGNALS =====\n");
 
-    if (nlhs>=3 && raw!=NULL)
-    {
-        DBG("\n===== OUTPUT LOOP =====\n");
-        DBG("num_data_records: %d\n", hdr.num_data_records);
-        DBG("=======================\n\n");
+        for (int s = 0; s < hdr.num_signals; s++) {
+            if (!need_raw[s]) continue;
 
-        ASSERT(hdr.num_data_records > 0);
+            mwSize spr = (mwSize)sig[s].samples_in_record;
+            mwSize len = spr * (mwSize)hdr.num_data_records;
 
-        plhs[2]=mxCreateCellMatrix(1,hdr.num_signals);
-
-        mwSize offset=0;
-
-        for (int s=0;s<hdr.num_signals;s++)
-        {
-            mwSize spr=sig[s].samples_in_record;
-            mwSize len=spr*hdr.num_data_records;
-
-            DBG("Signal %d output length: %llu\n",
-                s,(unsigned long long)len);
+            DBG("Decoding signal %d (%s), len=%llu\n",
+                s, sig[s].signal_labels, (unsigned long long)len);
 
             ASSERT(len > 0);
             ASSERT(sig[s].digital_max != sig[s].digital_min);
 
-            mxArray *v=mxCreateDoubleMatrix(1,len,mxREAL);
-            double *out=mxGetPr(v);
+            double *out = mxMalloc(len * sizeof(double));
 
-            double scale=(sig[s].physical_max-sig[s].physical_min) /
-                (sig[s].digital_max-sig[s].digital_min);
+            double scale = (sig[s].physical_max - sig[s].physical_min) /
+                           (sig[s].digital_max  - sig[s].digital_min);
+            double offs  =  sig[s].physical_min - sig[s].digital_min * scale;
 
-            double offs=sig[s].physical_min -
-                sig[s].digital_min*scale;
+            mwSize out_i = 0;
+            for (mwSize r = 0; r < (mwSize)hdr.num_data_records; r++) {
+                mwSize base = r * total_samp_per_rec + sig_offset[s];
+                for (mwSize k = 0; k < spr; k++) {
+                    mwSize bidx = 2 * (base + k);
+                    int16_t vraw = (int16_t)(raw[bidx] | (raw[bidx+1] << 8));
 
-            mwSize out_i=0;
+                    if (g_debug && s == 0 && r == 0 && k < 5)
+                        DBG("Raw[%llu]=%d\n", (unsigned long long)k, vraw);
 
-            for (mwSize r=0;r<hdr.num_data_records;r++)
-            {
-                mwSize base=r*total_samp_per_rec + offset;
-
-                for (mwSize k=0;k<spr;k++)
-                {
-                    mwSize idx=2*(base+k);
-                    int16_t vraw=
-                        (int16_t)(raw[idx] |
-                        (raw[idx+1]<<8));
-
-                    if (g_debug && s==0 && r==0 && k<5)
-                        DBG("Raw[%llu]=%d\n",
-                            (unsigned long long)k,
-                            vraw);
-
-                    out[out_i++]=vraw*scale+offs;
+                    out[out_i++] = vraw * scale + offs;
                 }
             }
 
-            mxSetCell(plhs[2],s,v);
-            offset+=spr;
+            raw_signals[s] = out;
+            sig_lengths[s]  = len;
         }
 
+        DBG("============================\n\n");
+
+        mxFree(sig_offset);
         mxFree(raw);
     }
 
     /* ============================================================
-    *                     ANNOTATION OUTPUT
-    * ============================================================ */
+     *                       HEADER OUTPUT
+     * ============================================================ */
 
-    if (nlhs>=4 && annot_idx>=0)
-    {
-        const char *f[]={"onset","text"};
-        mxArray *A = mxCreateStructMatrix(0,0,2,f);
+    if (nlhs >= 1) {
+        const char *f[] = {"edf_ver","patient_id","local_rec_id",
+                           "recording_startdate","recording_starttime",
+                           "num_header_bytes","num_data_records",
+                           "data_record_duration","num_signals"};
+
+        plhs[0] = mxCreateStructMatrix(1, 1, 9, f);
+
+        mxSetField(plhs[0], 0, "edf_ver",               mxCreateString(hdr.edf_ver));
+        mxSetField(plhs[0], 0, "patient_id",             mxCreateString(hdr.patient_id));
+        mxSetField(plhs[0], 0, "local_rec_id",           mxCreateString(hdr.local_rec_id));
+        mxSetField(plhs[0], 0, "recording_startdate",    mxCreateString(hdr.recording_startdate));
+        mxSetField(plhs[0], 0, "recording_starttime",    mxCreateString(hdr.recording_starttime));
+        mxSetField(plhs[0], 0, "num_header_bytes",       mxCreateDoubleScalar(hdr.num_header_bytes));
+        mxSetField(plhs[0], 0, "num_data_records",       mxCreateDoubleScalar((double)hdr.num_data_records));
+        mxSetField(plhs[0], 0, "data_record_duration",   mxCreateDoubleScalar(hdr.data_record_duration));
+        mxSetField(plhs[0], 0, "num_signals",            mxCreateDoubleScalar(hdr.num_signals));
+    }
+
+    /* ============================================================
+     *         SIGNAL HEADER + DATA OUTPUT (channel-plan aware)
+     * ============================================================ */
+
+    /*
+     * Determine the output channel list:
+     *   • If a channel plan was built  →  iterate plan[] in order.
+     *   • Otherwise                    →  emit all signals in file order.
+     */
+    int out_count;          /* number of output channels */
+
+    if (use_channel_plan) {
+        out_count = nplan;
+    } else {
+        out_count = hdr.num_signals;
+    }
+
+    /* ---- Signal header output ---- */
+    if (nlhs >= 2) {
+        const char *f[] = {"signal_labels","transducer_type",
+                           "physical_dimension","physical_min",
+                           "physical_max","digital_min",
+                           "digital_max","prefiltering",
+                           "samples_in_record","sampling_frequency"};
+
+        plhs[1] = mxCreateStructMatrix(1, out_count, 10, f);
+
+        for (int o = 0; o < out_count; o++) {
+            int s;          /* raw signal index for this output slot */
+            const char *lbl;
+
+            if (use_channel_plan) {
+                /* For reref we inherit ChA's header */
+                s   = (plan[o].raw_idx_a >= 0) ? plan[o].raw_idx_a : 0;
+                lbl = plan[o].label;
+            } else {
+                s   = o;
+                lbl = sig[o].signal_labels;
+            }
+
+            mxSetField(plhs[1], o, "signal_labels",
+                       mxCreateString(lbl));
+            mxSetField(plhs[1], o, "transducer_type",
+                       mxCreateString(sig[s].transducer_type));
+            mxSetField(plhs[1], o, "physical_dimension",
+                       mxCreateString(sig[s].physical_dimension));
+            mxSetField(plhs[1], o, "physical_min",
+                       mxCreateDoubleScalar(sig[s].physical_min));
+            mxSetField(plhs[1], o, "physical_max",
+                       mxCreateDoubleScalar(sig[s].physical_max));
+            mxSetField(plhs[1], o, "digital_min",
+                       mxCreateDoubleScalar(sig[s].digital_min));
+            mxSetField(plhs[1], o, "digital_max",
+                       mxCreateDoubleScalar(sig[s].digital_max));
+            mxSetField(plhs[1], o, "prefiltering",
+                       mxCreateString(sig[s].prefiltering));
+            mxSetField(plhs[1], o, "samples_in_record",
+                       mxCreateDoubleScalar(sig[s].samples_in_record));
+            mxSetField(plhs[1], o, "sampling_frequency",
+                       mxCreateDoubleScalar(sig[s].sampling_frequency));
+        }
+    }
+
+    /* ---- Signal data output ---- */
+    if (nlhs >= 3 && raw_signals != NULL) {
+        ASSERT(hdr.num_data_records > 0);
+
+        plhs[2] = mxCreateCellMatrix(1, out_count);
+
+        for (int o = 0; o < out_count; o++) {
+            if (use_channel_plan) {
+                int ia = plan[o].raw_idx_a;
+                int ib = plan[o].raw_idx_b;
+
+                if (ia < 0) {
+                    /* Unknown channel requested – emit empty */
+                    mxSetCell(plhs[2], o, mxCreateDoubleMatrix(1, 0, mxREAL));
+                    mexWarnMsgIdAndTxt("read_EDF_mex:UnknownChannel",
+                        "Channel '%s' not found in file.", plan[o].label);
+                    continue;
+                }
+
+                mwSize len = sig_lengths[ia];
+
+                mxArray *v = mxCreateDoubleMatrix(1, len, mxREAL);
+                double  *d = mxGetPr(v);
+
+                if (plan[o].kind == CH_PLAIN) {
+                    /* Direct copy */
+                    memcpy(d, raw_signals[ia], len * sizeof(double));
+                } else {
+                    /* Rereferenced: ChA - ChB  (lengths must match) */
+                    mwSize len_b = sig_lengths[ib];
+                    if (len != len_b) {
+                        mxDestroyArray(v);
+                        mexErrMsgIdAndTxt("read_EDF_mex:RerefLength",
+                            "Rereferenced channels '%s' have different lengths "
+                            "(%llu vs %llu).",
+                            plan[o].label,
+                            (unsigned long long)len,
+                            (unsigned long long)len_b);
+                    }
+                    double *da = raw_signals[ia];
+                    double *db = raw_signals[ib];
+                    for (mwSize k = 0; k < len; k++)
+                        d[k] = da[k] - db[k];
+                }
+
+                mxSetCell(plhs[2], o, v);
+
+            } else {
+                /* No channel plan – emit all decoded signals in file order */
+                mwSize len = sig_lengths[o];
+                mxArray *v = mxCreateDoubleMatrix(1, len, mxREAL);
+                memcpy(mxGetPr(v), raw_signals[o], len * sizeof(double));
+                mxSetCell(plhs[2], o, v);
+            }
+        }
+    }
+
+    /* Free per-signal decode buffers */
+    if (raw_signals) {
+        for (int s = 0; s < hdr.num_signals; s++)
+            if (raw_signals[s]) mxFree(raw_signals[s]);
+        mxFree(raw_signals);
+    }
+    if (sig_lengths) mxFree(sig_lengths);
+
+    /* ============================================================
+     *                     ANNOTATION OUTPUT
+     * ============================================================ */
+
+    if (nlhs >= 4 && annot_idx >= 0) {
+        const char *f[] = {"onset", "text"};
+        mxArray *A = mxCreateStructMatrix(0, 0, 2, f);
 
         Annotation *alist = NULL;
         mwSize acount = 0;
 
-        for (mwSize r=0;r<hdr.num_data_records;r++)
-        {
+        for (mwSize r = 0; r < (mwSize)hdr.num_data_records; r++) {
             mwSize byte_off = 0;
-            for (int i=0;i<annot_idx;i++)
-                byte_off += sig[i].samples_in_record*2;
+            for (int i = 0; i < annot_idx; i++)
+                byte_off += sig[i].samples_in_record * 2;
 
-            mwSize annot_bytes =
-                sig[annot_idx].samples_in_record*2;
-
+            mwSize annot_bytes = sig[annot_idx].samples_in_record * 2;
             unsigned char *blk = mxMalloc(annot_bytes);
 
             fseek(fid,
-                  hdr.num_header_bytes +
-                  r*bytes_per_rec +
-                  byte_off,
+                  hdr.num_header_bytes + r * bytes_per_rec + byte_off,
                   SEEK_SET);
-
             fread(blk, 1, annot_bytes, fid);
 
-            parse_tal_block_fast(blk, annot_bytes,
-                                 &alist, &acount);
-
+            parse_tal_block_fast(blk, annot_bytes, &alist, &acount);
             mxFree(blk);
         }
 
         if (acount > 0) {
             mxDestroyArray(A);
-            A = mxCreateStructMatrix(acount,1,2,f);
-            for (mwSize i=0;i<acount;i++) {
-                mxSetField(A,i,"onset",
-                           mxCreateDoubleScalar(alist[i].onset));
-                mxSetField(A,i,"text",
-                           alist[i].texts);
+            A = mxCreateStructMatrix(acount, 1, 2, f);
+            for (mwSize i = 0; i < acount; i++) {
+                mxSetField(A, i, "onset", mxCreateDoubleScalar(alist[i].onset));
+                mxSetField(A, i, "text",  alist[i].texts);
             }
         }
 
@@ -673,6 +924,9 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         plhs[3] = A;
     }
 
+    /* ---- Cleanup ---- */
+    if (plan)     mxFree(plan);
+    if (need_raw) mxFree(need_raw);
     mxFree(sig);
     fclose(fid);
 }
