@@ -1,0 +1,40 @@
+/* Prerau Lab branding overlay on top of default Furo.
+   Goal: keep Furo's clean minimalist look, add the lab's Fira Sans type
+   system and a "PRERAU LAB" eyebrow above the project title.
+   Lab-site specs (from prerau.bwh.harvard.edu):
+     - font-family: "Fira Sans", weight 300
+     - text-transform: uppercase
+     - letter-spacing: 0.075em
+*/
+
+:root,
+body {
+  --font-stack: "Fira Sans", -apple-system, BlinkMacSystemFont, "Segoe UI",
+                Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-stack--monospace: "JetBrains Mono", SFMono-Regular, Consolas,
+                           "Liberation Mono", Menlo, monospace;
+}
+
+.sidebar-brand {
+  text-decoration: none;
+  padding-top: 1.2rem;
+}
+
+.sidebar-brand::before {
+  content: "Prerau Lab";
+  display: block;
+  font-family: "Fira Sans", var(--font-stack);
+  font-weight: 300;
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.075em;
+  color: var(--color-foreground-muted);
+  margin-bottom: 0.25rem;
+  line-height: 1.38;
+}
+
+.sidebar-brand-text {
+  font-family: "Fira Sans", var(--font-stack);
+  font-weight: 500;
+  letter-spacing: -0.005em;
+}
