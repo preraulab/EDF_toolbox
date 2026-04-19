@@ -51,10 +51,7 @@ source_suffix = {
 
 html_theme = "furo"
 html_static_path = ["_static"]
-html_css_files = [
-    "https://fonts.googleapis.com/css2?family=Fira+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap",
-    "prerau.css",
-]
+html_css_files = ["prerau.css"]
 html_title = "read_EDF"
 html_short_title = "read_EDF"
 
