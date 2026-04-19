@@ -1,7 +1,8 @@
 API Reference
 =============
 
-.. mat:module:: .
+.. toctree::
+   :maxdepth: 1
 
-.. mat:autofunction:: read_EDF
-.. mat:autofunction:: header_gui
+   api/read_EDF
+   api/header_gui
