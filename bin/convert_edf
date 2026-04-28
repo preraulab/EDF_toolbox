@@ -16,6 +16,10 @@
 #       --zstd-level N         1..22 (default 3)
 #       --no-gzip              (deprecated) alias for --compress-mode none
 #       --no-parallel          Disable parfor
+#       --stage-local          Copy each input to local scratch before
+#                              converting; helps when inputs live on NFS
+#                              and parfor workers contend at the server.
+#       --stage-dir DIR        Local scratch root (default: system tempdir)
 #       --pattern GLOB         Pattern when DIR is given (default: *.edf)
 #       --matlab PATH          Path to matlab binary (default: auto-detect)
 #       --autoscale MODE       recompute (default) | preserve
@@ -27,7 +31,7 @@
 set -eu
 
 usage() {
-    sed -n '2,/^[^#]/p' "$0" | sed 's/^# \{0,1\}//; s/^!.*//;' | head -n 26
+    sed -n '2,/^[^#]/p' "$0" | sed 's/^# \{0,1\}//; s/^!.*//;' | head -n 30
 }
 
 die() { echo "convert_edf: $*" >&2; exit 2; }
@@ -39,6 +43,8 @@ COMPRESS_MODE="zstd"
 GZIP_LEVEL="6"
 ZSTD_LEVEL="3"
 PARALLEL="true"
+STAGE_LOCAL="false"
+STAGE_DIR=""
 PATTERN="*.edf"
 MATLAB=""
 AUTOSCALE="recompute"
@@ -58,6 +64,8 @@ while [ $# -gt 0 ]; do
         --zstd-level)         shift; ZSTD_LEVEL="${1:-}";;
         --no-gzip)            COMPRESS_MODE="none";;
         --no-parallel)        PARALLEL="false";;
+        --stage-local)        STAGE_LOCAL="true";;
+        --stage-dir)          shift; STAGE_DIR="${1:-}"; STAGE_LOCAL="true";;
         --pattern)            shift; PATTERN="${1:-}";;
         --matlab)             shift; MATLAB="${1:-}";;
         --autoscale)          shift; AUTOSCALE="${1:-}";;
@@ -127,6 +135,8 @@ M_CMD="$M_CMD; opts = [opts, {'CompressMode', '$(escape_q "$COMPRESS_MODE")'}]"
 M_CMD="$M_CMD; opts = [opts, {'GzipLevel', $GZIP_LEVEL}]"
 M_CMD="$M_CMD; opts = [opts, {'ZstdLevel', $ZSTD_LEVEL}]"
 M_CMD="$M_CMD; opts = [opts, {'Parallel', $PARALLEL}]"
+M_CMD="$M_CMD; opts = [opts, {'StageLocal', $STAGE_LOCAL}]"
+[ -n "$STAGE_DIR" ] && M_CMD="$M_CMD; opts = [opts, {'StageDir', '$(escape_q "$STAGE_DIR")'}]"
 M_CMD="$M_CMD; opts = [opts, {'Pattern', '$(escape_q "$PATTERN")'}]"
 M_CMD="$M_CMD; opts = [opts, {'Verbose', $VERBOSE}]"
 M_CMD="$M_CMD; opts = [opts, {'AutoScale', '$(escape_q "$AUTOSCALE")'}]"

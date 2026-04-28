@@ -195,6 +195,21 @@ fprintf('%d / %d files converted, total elapsed %.1f s\n', ...
 disp(result(strcmp(result.status, 'failed'), {'input', 'error_message'}));
 ```
 
+**Staging on NFS / shared storage.** When inputs and outputs live on a shared network filesystem (NFS, Lustre, etc.), running multiple `parfor` workers against the same mount typically *slows things down* because the workers contend at the file server — each per-file conversion can take 5-10× longer than serial. Pass `'StageLocal', true` to copy each input to a local scratch directory first, run the conversion locally, then move the output back. Disk space required per worker is roughly one input file at a time.
+
+```matlab
+% Stage to system tempdir (default) — fixes NFS contention almost always
+result = batch_convert_EDF('/data/nfs/edfs', 100, ...
+    'OutputDir',  '/data/nfs/out', ...
+    'StageLocal', true);
+
+% Pin to a specific local scratch location (e.g. fast NVMe)
+result = batch_convert_EDF('/data/nfs/edfs', 100, ...
+    'OutputDir',  '/data/nfs/out', ...
+    'StageLocal', true, ...
+    'StageDir',   '/scratch/local');
+```
+
 ### Shell CLI
 
 `bin/convert_edf` is a POSIX shell wrapper for `batch_convert_EDF`. It auto-detects `matlab` on `$PATH` (or in standard install locations on macOS/Linux), invokes a single `matlab -batch`, and exits non-zero if any file failed.
@@ -210,6 +225,10 @@ bin/convert_edf -r 128 -o /path/out /path/in
 
 # Switch to gzip output, level 1 (fastest gzip)
 bin/convert_edf -r 128 --compress-mode gzip --gzip-level 1 /path/in
+
+# Inputs live on NFS — stage to local scratch to avoid worker contention
+bin/convert_edf -r 128 -o /data/nfs/out --stage-local /data/nfs/in
+bin/convert_edf -r 128 -o /data/nfs/out --stage-dir /scratch /data/nfs/in
 
 # Disable compression and parfor; run quietly
 bin/convert_edf -r 128 --compress-mode none --no-parallel /path/file.edf

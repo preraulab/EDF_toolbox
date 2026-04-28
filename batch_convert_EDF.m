@@ -20,6 +20,16 @@ function result = batch_convert_EDF(input_spec, target_rate, varargin)
 %       'Parallel'     : true (default if a parpool exists). When true and no
 %                        pool exists, attempts to start one; falls back to
 %                        serial on failure.
+%       'StageLocal'   : false (default). When true, each file is first
+%                        copied to a local scratch directory, converted
+%                        there, then the output is moved to its final
+%                        location. Use this when inputs/outputs live on
+%                        NFS / shared storage where concurrent reads from
+%                        many parfor workers would contend at the file
+%                        server. Disk space required per worker = one
+%                        input file + one output file at a time.
+%       'StageDir'     : '' (default: system temp dir from `tempname`).
+%                        Only used when 'StageLocal' is true.
 %       'Pattern'      : '*.edf' (default; matches .edf, .edf.gz, .edf.zst)
 %       'Verbose'      : false (default)
 %       'AutoScale'    : 'recompute' (default) | 'preserve'. See convert_EDF
@@ -47,6 +57,8 @@ addParameter(p, 'Compress',     true, @islogical);
 addParameter(p, 'GzipLevel',    6, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 9);
 addParameter(p, 'ZstdLevel',    3, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
 addParameter(p, 'Parallel',     [], @(x) isempty(x) || islogical(x));
+addParameter(p, 'StageLocal',   false, @islogical);
+addParameter(p, 'StageDir',     '', @ischar);
 addParameter(p, 'Pattern',      '*.edf', @ischar);
 addParameter(p, 'Verbose',      false, @islogical);
 addParameter(p, 'AutoScale',    'recompute', @(s) any(strcmpi(s, {'preserve','recompute'})));
@@ -59,6 +71,8 @@ compress     = p.Results.Compress;
 gzip_level   = double(p.Results.GzipLevel);
 zstd_level   = double(p.Results.ZstdLevel);
 do_parallel  = p.Results.Parallel;
+stage_local  = p.Results.StageLocal;
+stage_dir    = p.Results.StageDir;
 pattern      = p.Results.Pattern;
 verbose      = p.Results.Verbose;
 autoscale    = p.Results.AutoScale;
@@ -110,14 +124,16 @@ if do_parallel
     parfor k = 1:n
         [out_paths{k}, statuses{k}, elapsed_s(k), error_messages{k}] = ...
             run_one(files{k}, target_rate, out_dir, compress_mode, ...
-                    gzip_level, zstd_level, autoscale, false);
+                    gzip_level, zstd_level, autoscale, ...
+                    stage_local, stage_dir, false);
     end
 else
     for k = 1:n
         if verbose, fprintf('  [%d/%d] %s\n', k, n, files{k}); end
         [out_paths{k}, statuses{k}, elapsed_s(k), error_messages{k}] = ...
             run_one(files{k}, target_rate, out_dir, compress_mode, ...
-                    gzip_level, zstd_level, autoscale, verbose);
+                    gzip_level, zstd_level, autoscale, ...
+                    stage_local, stage_dir, verbose);
     end
 end
 
@@ -133,7 +149,8 @@ end
 
 %% =========================================================================
 function [out_path, status, elapsed, errmsg] = run_one(in_fname, target_rate, ...
-    out_dir, compress_mode, gzip_level, zstd_level, autoscale, verbose)
+    out_dir, compress_mode, gzip_level, zstd_level, autoscale, ...
+    stage_local, stage_dir, verbose)
 
 t0 = tic;
 out_path = '';
@@ -151,19 +168,52 @@ try
         otherwise,   out_ext = '.edf';
     end
     if isempty(out_dir), out_dir = dir_; end
-    out_name = fullfile(out_dir, sprintf('%s_%dHz%s', base, round(target_rate), out_ext));
+    final_out = fullfile(out_dir, sprintf('%s_%dHz%s', base, round(target_rate), out_ext));
 
     if ~isfolder(out_dir), mkdir(out_dir); end
 
-    convert_EDF(in_fname, target_rate, ...
-        'OutputName',   out_name, ...
-        'CompressMode', compress_mode, ...
-        'GzipLevel',    gzip_level, ...
-        'ZstdLevel',    zstd_level, ...
-        'Verbose',      verbose, ...
-        'AutoScale',    autoscale);
+    if stage_local
+        % Copy input to local scratch, convert there, move output back.
+        % Avoids per-worker NFS read contention.
+        if isempty(stage_dir)
+            scratch = tempname();          % uses system $TMPDIR / tempdir()
+        else
+            scratch = tempname(stage_dir); % unique subdir under user-supplied root
+        end
+        mkdir(scratch);
+        cleanup = onCleanup(@() rmdir(scratch, 's')); %#ok<NASGU>
 
-    out_path = out_name;
+        [~, in_base, in_ext] = fileparts(in_fname);
+        local_in = fullfile(scratch, [in_base in_ext]);
+        copyfile(in_fname, local_in);
+
+        local_out = fullfile(scratch, ...
+            sprintf('%s_%dHz%s', base, round(target_rate), out_ext));
+
+        if verbose
+            fprintf('    staged to %s\n', scratch);
+        end
+
+        convert_EDF(local_in, target_rate, ...
+            'OutputName',   local_out, ...
+            'CompressMode', compress_mode, ...
+            'GzipLevel',    gzip_level, ...
+            'ZstdLevel',    zstd_level, ...
+            'Verbose',      verbose, ...
+            'AutoScale',    autoscale);
+
+        movefile(local_out, final_out, 'f');
+    else
+        convert_EDF(in_fname, target_rate, ...
+            'OutputName',   final_out, ...
+            'CompressMode', compress_mode, ...
+            'GzipLevel',    gzip_level, ...
+            'ZstdLevel',    zstd_level, ...
+            'Verbose',      verbose, ...
+            'AutoScale',    autoscale);
+    end
+
+    out_path = final_out;
     status   = 'ok';
 catch ME
     errmsg = ME.message;
