@@ -1,19 +1,24 @@
 function write_EDF(out_fname, header, signal_header, signal_cell, varargin)
-%WRITE_EDF  Write an EDF / EDF+ file (with optional gzip output)
+%WRITE_EDF  Write an EDF / EDF+ file (with optional gzip or zstd output)
 %
 %   WRITE_EDF is the structural mirror of READ_EDF. It accepts the same
 %   header / signal_header / signal_cell / annotations shapes that
 %   READ_EDF returns, and produces a valid EDF or EDF+ file. Output is
-%   written via a compiled MEX (with vendored zlib for .edf.gz) when
-%   available, or a pure MATLAB fallback otherwise.
+%   written via a compiled MEX (with zlib for .edf.gz and libzstd for
+%   .edf.zst) when available, or a pure MATLAB fallback otherwise.
 %
 %   Usage:
 %       write_EDF(out_fname, header, signal_header, signal_cell)
 %       write_EDF(out_fname, header, signal_header, signal_cell, annotations)
 %       write_EDF(..., 'AutoScale', 'preserve' | 'recompute', ...)
+%       write_EDF(..., 'GzipLevel', 1..9, ...)    % only for .edf.gz
+%       write_EDF(..., 'ZstdLevel', 1..22, ...)   % only for .edf.zst
 %
 %   Inputs:
-%       out_fname     : output file path. Ends in '.gz' -> gzipped output.
+%       out_fname     : output file path.
+%                         ends in '.gz'  -> gzipped output (zlib)
+%                         ends in '.zst' -> zstd output (libzstd)
+%                         otherwise      -> plain EDF
 %       header        : 1x1 struct (matches read_EDF's first output)
 %       signal_header : 1xN struct array (matches read_EDF's second output)
 %       signal_cell   : 1xN cell array of physical-unit channel vectors
@@ -25,20 +30,27 @@ function write_EDF(out_fname, header, signal_header, signal_cell, varargin)
 %       'AutoScale'   : 'preserve' (default) -> keep existing physical_min/max
 %                       'recompute'         -> set from data (lossless if data
 %                                              fits within int16 dynamic range)
+%       'GzipLevel'   : integer 1..9 (default 6). Used only when out_fname
+%                       ends in '.gz'. Lower = faster, larger output.
+%       'ZstdLevel'   : integer 1..22 (default 3). Used only when out_fname
+%                       ends in '.zst'. Higher = slower, smaller output.
 %       'debug'       : logical (default false)
 %
 %   Output naming:
 %       If out_fname ends in '.gz' (case-insensitive), the writer streams
-%       through zlib and produces a gzipped EDF on the fly (no temp file).
+%       through zlib and produces a gzipped EDF on the fly. If it ends in
+%       '.zst', the writer streams through libzstd. Otherwise plain EDF.
 %
 %   AutoScale notes:
-%       'preserve' is the default because it is required for lossless
-%       round-trip: read_EDF -> write_EDF reproduces the original file
-%       up to ~1 digital LSB per sample (limited by float rounding in
-%       physical-units storage).
-%       'recompute' may shift the physical range if the input data
-%       exceeds the original physical_min/max -- prevents clipping at
-%       the cost of changing the file's stored scaling.
+%       'preserve' is the default for write_EDF because the lower-level
+%       contract is "write what you were given." It is required for
+%       lossless round-trip: read_EDF -> write_EDF reproduces the original
+%       file up to ~1 digital LSB per sample.
+%       'recompute' resets each channel's physical_min/max from the actual
+%       data range -- use this when the input data may exceed the existing
+%       physical_min/max (e.g. after a resample's anti-aliasing filter
+%       briefly produces out-of-range samples). Note: convert_EDF defaults
+%       to 'recompute' for exactly that reason.
 %
 %   See also: read_EDF, convert_EDF, batch_convert_EDF.
 
@@ -60,12 +72,16 @@ p = inputParser;
 addParameter(p, 'Verbose',     false, @islogical);
 addParameter(p, 'forceMATLAB', false, @islogical);
 addParameter(p, 'AutoScale',   'preserve', @(s) any(strcmpi(s, {'preserve','recompute'})));
+addParameter(p, 'GzipLevel',   6, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 9);
+addParameter(p, 'ZstdLevel',   3, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
 addParameter(p, 'debug',       false, @islogical);
 parse(p, varargin{:});
 
 verbose      = p.Results.Verbose;
 force_matlab = p.Results.forceMATLAB;
 autoscale    = lower(p.Results.AutoScale);
+gzip_level   = double(p.Results.GzipLevel);
+zstd_level   = double(p.Results.ZstdLevel);
 debug        = p.Results.debug;
 
 out_fname = char(out_fname);
@@ -106,7 +122,8 @@ if ~force_matlab
     try
         autoscale_mode = double(strcmp(autoscale, 'recompute'));
         write_EDF_mex(out_fname, header, signal_header, signal_cell, ...
-                      annotations, autoscale_mode, double(verbose), double(debug));
+                      annotations, autoscale_mode, double(verbose), double(debug), ...
+                      gzip_level, zstd_level);
         return
     catch ME
         if verbose
@@ -121,7 +138,7 @@ end
 
 %% ---------------- MATLAB FALLBACK ----------------
 write_EDF_matlab(out_fname, header, signal_header, signal_cell, annotations, ...
-                 autoscale, verbose);
+                 autoscale, verbose, gzip_level, zstd_level);
 
 end
 
@@ -130,15 +147,18 @@ end
 %  PURE MATLAB EDF WRITER
 % =========================================================================
 function write_EDF_matlab(out_fname, header, signal_header, signal_cell, ...
-                          annotations, autoscale, verbose)
+                          annotations, autoscale, verbose, gzip_level, zstd_level)
 
-% gz output: write plain to a temp file, then gzip and delete temp.
-gz_cleanup = []; %#ok<NASGU>
+% Compressed output (.gz / .zst): write plain to a temp file, then compress
+% via shell (so we can honor the requested level).
+comp_cleanup = []; %#ok<NASGU>
 final_out = out_fname;
-if endsWith(out_fname, '.gz', 'IgnoreCase', true)
+out_is_gz  = endsWith(out_fname, '.gz',  'IgnoreCase', true);
+out_is_zst = endsWith(out_fname, '.zst', 'IgnoreCase', true);
+if out_is_gz || out_is_zst
     tmpdir = tempname;
     mkdir(tmpdir);
-    gz_cleanup = onCleanup(@() rmdir(tmpdir, 's'));
+    comp_cleanup = onCleanup(@() rmdir(tmpdir, 's'));
     [~, base, ~] = fileparts(out_fname);
     [~, base2, ~] = fileparts(base);  % strip .edf
     if isempty(base2), base2 = base; end
@@ -297,14 +317,31 @@ end
 
 clear clean_fid;  % triggers fclose
 
-% Compress if requested
+% Compress if requested. Shell out so we can honor the requested level.
 if ~strcmp(out_fname, final_out)
-    if verbose, fprintf('Gzipping output...\n'); end
-    gzip(out_fname, fileparts(final_out));
-    % gzip writes <out_fname>.gz; rename if needed
-    written = [out_fname '.gz'];
-    if ~strcmp(written, final_out)
-        movefile(written, final_out, 'f');
+    if out_is_zst
+        if verbose, fprintf('Compressing output (zstd -%d)...\n', zstd_level); end
+        cmd = sprintf('zstd -q -%d -f -o %s %s', zstd_level, ...
+            shell_quote(final_out), shell_quote(out_fname));
+        [rc, msg] = system(cmd);
+        if rc ~= 0
+            error('write_EDF:Zstd', 'zstd command failed: %s', strtrim(msg));
+        end
+    else
+        if verbose, fprintf('Compressing output (gzip -%d)...\n', gzip_level); end
+        cmd = sprintf('gzip -%d -f -c %s > %s', gzip_level, ...
+            shell_quote(out_fname), shell_quote(final_out));
+        [rc, msg] = system(cmd);
+        if rc ~= 0
+            % Fall back to MATLAB gzip (level 6, no flag honored)
+            warning('write_EDF:Gzip', ...
+                'gzip command failed (%s); falling back to MATLAB gzip.', strtrim(msg));
+            gzip(out_fname, fileparts(final_out));
+            written = [out_fname '.gz'];
+            if ~strcmp(written, final_out)
+                movefile(written, final_out, 'f');
+            end
+        end
     end
 end
 
@@ -405,4 +442,10 @@ function fclose_safe(fid)
 if fid > 0
     try, fclose(fid); catch, end
 end
+end
+
+function s = shell_quote(s)
+% POSIX shell single-quoting; suitable for the Bash that MATLAB system()
+% invokes on macOS / Linux. Embeds any single quotes safely.
+s = ['''' strrep(s, '''', '''\''''') ''''];
 end

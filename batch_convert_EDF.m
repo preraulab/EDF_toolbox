@@ -11,14 +11,19 @@ function result = batch_convert_EDF(input_spec, target_rate, varargin)
 %       target_rate : target sample rate (Hz) for all signals
 %
 %   Name-value pairs:
-%       'OutputDir' : '' (default: alongside each input file)
-%       'Compress'  : true (default) -> .edf.gz outputs
-%       'Parallel'  : true (default if a parpool exists). When true and no
-%                     pool exists, attempts to start one; falls back to
-%                     serial on failure.
-%       'Pattern'   : '*.edf' (default; matches both .edf and .edf.gz)
-%       'Verbose'   : false (default)
-%       'AutoScale' : 'preserve' (default) | 'recompute'
+%       'OutputDir'    : '' (default: alongside each input file)
+%       'CompressMode' : 'zstd' (default) | 'gzip' | 'none'
+%       'Compress'     : (deprecated) true -> 'zstd', false -> 'none'.
+%                        'CompressMode' takes precedence if both are passed.
+%       'GzipLevel'    : integer 1..9 (default 6)
+%       'ZstdLevel'    : integer 1..22 (default 3)
+%       'Parallel'     : true (default if a parpool exists). When true and no
+%                        pool exists, attempts to start one; falls back to
+%                        serial on failure.
+%       'Pattern'      : '*.edf' (default; matches .edf, .edf.gz, .edf.zst)
+%       'Verbose'      : false (default)
+%       'AutoScale'    : 'recompute' (default) | 'preserve'. See convert_EDF
+%                        for the rationale on why 'recompute' is the default.
 %
 %   Output:
 %       result : table with columns
@@ -36,21 +41,31 @@ function result = batch_convert_EDF(input_spec, target_rate, varargin)
 p = inputParser;
 addRequired(p,  'input_spec');
 addRequired(p,  'target_rate', @(x) isnumeric(x) && isscalar(x) && x > 0);
-addParameter(p, 'OutputDir',  '', @ischar);
-addParameter(p, 'Compress',   true, @islogical);
-addParameter(p, 'Parallel',   [], @(x) isempty(x) || islogical(x));
-addParameter(p, 'Pattern',    '*.edf', @ischar);
-addParameter(p, 'Verbose',    false, @islogical);
-addParameter(p, 'AutoScale',  'preserve', @(s) any(strcmpi(s, {'preserve','recompute'})));
+addParameter(p, 'OutputDir',    '', @ischar);
+addParameter(p, 'CompressMode', '', @(s) ischar(s) && (isempty(s) || any(strcmpi(s, {'gzip','zstd','none'}))));
+addParameter(p, 'Compress',     true, @islogical);
+addParameter(p, 'GzipLevel',    6, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 9);
+addParameter(p, 'ZstdLevel',    3, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
+addParameter(p, 'Parallel',     [], @(x) isempty(x) || islogical(x));
+addParameter(p, 'Pattern',      '*.edf', @ischar);
+addParameter(p, 'Verbose',      false, @islogical);
+addParameter(p, 'AutoScale',    'recompute', @(s) any(strcmpi(s, {'preserve','recompute'})));
 parse(p, input_spec, target_rate, varargin{:});
 
-target_rate = double(p.Results.target_rate);
-out_dir     = p.Results.OutputDir;
-compress    = p.Results.Compress;
-do_parallel = p.Results.Parallel;
-pattern     = p.Results.Pattern;
-verbose     = p.Results.Verbose;
-autoscale   = p.Results.AutoScale;
+target_rate  = double(p.Results.target_rate);
+out_dir      = p.Results.OutputDir;
+compress_mode= lower(p.Results.CompressMode);
+compress     = p.Results.Compress;
+gzip_level   = double(p.Results.GzipLevel);
+zstd_level   = double(p.Results.ZstdLevel);
+do_parallel  = p.Results.Parallel;
+pattern      = p.Results.Pattern;
+verbose      = p.Results.Verbose;
+autoscale    = p.Results.AutoScale;
+
+if isempty(compress_mode)
+    if compress, compress_mode = 'zstd'; else, compress_mode = 'none'; end
+end
 
 % --- Resolve input list ---------------------------------------------------
 files = resolve_inputs(input_spec, pattern);
@@ -94,13 +109,15 @@ error_messages = cell(n, 1);
 if do_parallel
     parfor k = 1:n
         [out_paths{k}, statuses{k}, elapsed_s(k), error_messages{k}] = ...
-            run_one(files{k}, target_rate, out_dir, compress, autoscale, false);
+            run_one(files{k}, target_rate, out_dir, compress_mode, ...
+                    gzip_level, zstd_level, autoscale, false);
     end
 else
     for k = 1:n
         if verbose, fprintf('  [%d/%d] %s\n', k, n, files{k}); end
         [out_paths{k}, statuses{k}, elapsed_s(k), error_messages{k}] = ...
-            run_one(files{k}, target_rate, out_dir, compress, autoscale, verbose);
+            run_one(files{k}, target_rate, out_dir, compress_mode, ...
+                    gzip_level, zstd_level, autoscale, verbose);
     end
 end
 
@@ -116,7 +133,7 @@ end
 
 %% =========================================================================
 function [out_path, status, elapsed, errmsg] = run_one(in_fname, target_rate, ...
-    out_dir, compress, autoscale, verbose)
+    out_dir, compress_mode, gzip_level, zstd_level, autoscale, verbose)
 
 t0 = tic;
 out_path = '';
@@ -125,21 +142,26 @@ errmsg = '';
 
 try
     [dir_, base, ext] = fileparts(in_fname);
-    if strcmpi(ext, '.gz')
+    if strcmpi(ext, '.gz') || strcmpi(ext, '.zst')
         [~, base, ~] = fileparts(base);
     end
-    out_ext = '.edf.gz';
-    if ~compress, out_ext = '.edf'; end
+    switch compress_mode
+        case 'gzip', out_ext = '.edf.gz';
+        case 'zstd', out_ext = '.edf.zst';
+        otherwise,   out_ext = '.edf';
+    end
     if isempty(out_dir), out_dir = dir_; end
     out_name = fullfile(out_dir, sprintf('%s_%dHz%s', base, round(target_rate), out_ext));
 
     if ~isfolder(out_dir), mkdir(out_dir); end
 
     convert_EDF(in_fname, target_rate, ...
-        'OutputName', out_name, ...
-        'Compress',   compress, ...
-        'Verbose',    verbose, ...
-        'AutoScale',  autoscale);
+        'OutputName',   out_name, ...
+        'CompressMode', compress_mode, ...
+        'GzipLevel',    gzip_level, ...
+        'ZstdLevel',    zstd_level, ...
+        'Verbose',      verbose, ...
+        'AutoScale',    autoscale);
 
     out_path = out_name;
     status   = 'ok';

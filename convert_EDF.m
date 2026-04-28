@@ -4,22 +4,32 @@ function out_path = convert_EDF(in_fname, target_rate, varargin)
 %   out_path = convert_EDF(in_fname, target_rate)
 %   out_path = convert_EDF(in_fname, target_rate, 'OutputName', name, ...)
 %
-%   Reads an EDF or EDF.gz file with read_EDF, resamples every non-
-%   annotation channel to target_rate Hz using SPT's anti-aliased
-%   resample, and writes a new EDF (gzipped by default).
+%   Reads an EDF / .edf.gz / .edf.zst file with read_EDF, resamples every
+%   non-annotation channel to target_rate Hz using SPT's anti-aliased
+%   resample, and writes a new EDF (zstd-compressed by default — change
+%   with 'CompressMode').
 %
 %   Inputs:
-%       in_fname    : path to a .edf or .edf.gz file
+%       in_fname    : path to a .edf, .edf.gz, or .edf.zst file
 %       target_rate : target sample rate (Hz) for all signals
 %
 %   Name-value pairs:
-%       'OutputName' : explicit output path. Default:
-%                      <dir>/<basename>_<target_rate>Hz.edf.gz
-%       'Compress'   : true (default) -> .edf.gz output
-%                      false           -> .edf output (only used when
-%                                         OutputName is not set)
-%       'Verbose'    : logical (default false)
-%       'AutoScale'  : 'preserve' (default) | 'recompute' (passed to write_EDF)
+%       'OutputName'   : explicit output path. Default:
+%                        <dir>/<basename>_<target_rate>Hz<ext>
+%                        where <ext> depends on 'CompressMode'.
+%       'CompressMode' : 'zstd' (default) | 'gzip' | 'none'. Sets the
+%                        default output extension when 'OutputName' is not
+%                        provided (.edf.zst / .edf.gz / .edf).
+%       'Compress'     : (deprecated) true -> 'zstd', false -> 'none'.
+%                        'CompressMode' takes precedence if both are passed.
+%       'GzipLevel'    : integer 1..9 (default 6). Used for .gz outputs.
+%       'ZstdLevel'    : integer 1..22 (default 3). Used for .zst outputs.
+%       'Verbose'      : logical (default false)
+%       'AutoScale'    : 'recompute' (default) | 'preserve' (passed to
+%                        write_EDF). 'recompute' resets each channel's
+%                        physical_min/max to the actual data range so the
+%                        anti-aliasing filter's ringing isn't clipped at
+%                        the source file's narrower stored range.
 %
 %   Output:
 %       out_path : full path of the written file
@@ -35,23 +45,41 @@ function out_path = convert_EDF(in_fname, target_rate, varargin)
 %       resampled with SPT's resample (Kaiser-windowed sinc FIR; this is
 %       the anti-aliasing path -- naive downsample is NOT used).
 %
+%   Why AutoScale defaults to 'recompute':
+%       The anti-aliasing filter can briefly produce samples outside the
+%       source file's declared physical_min/max (filter ringing at sharp
+%       transients). With 'preserve' those samples get clipped to the
+%       int16 range on write. 'recompute' widens the stored range to the
+%       actual resampled data range, eliminating the clipping.
+%
 %   See also: read_EDF, write_EDF, batch_convert_EDF.
 
 p = inputParser;
 addRequired(p,  'in_fname');
 addRequired(p,  'target_rate', @(x) isnumeric(x) && isscalar(x) && x > 0);
-addParameter(p, 'OutputName',  '', @ischar);
-addParameter(p, 'Compress',    true, @islogical);
-addParameter(p, 'Verbose',     false, @islogical);
-addParameter(p, 'AutoScale',   'preserve', @(s) any(strcmpi(s, {'preserve','recompute'})));
+addParameter(p, 'OutputName',   '', @ischar);
+addParameter(p, 'CompressMode', '', @(s) ischar(s) && (isempty(s) || any(strcmpi(s, {'gzip','zstd','none'}))));
+addParameter(p, 'Compress',     true, @islogical);
+addParameter(p, 'GzipLevel',    6, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 9);
+addParameter(p, 'ZstdLevel',    3, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
+addParameter(p, 'Verbose',      false, @islogical);
+addParameter(p, 'AutoScale',    'recompute', @(s) any(strcmpi(s, {'preserve','recompute'})));
 parse(p, in_fname, target_rate, varargin{:});
 
-in_fname    = char(p.Results.in_fname);
-target_rate = double(p.Results.target_rate);
-out_name    = p.Results.OutputName;
-compress    = p.Results.Compress;
-verbose     = p.Results.Verbose;
-autoscale   = p.Results.AutoScale;
+in_fname     = char(p.Results.in_fname);
+target_rate  = double(p.Results.target_rate);
+out_name     = p.Results.OutputName;
+compress_mode= lower(p.Results.CompressMode);
+compress     = p.Results.Compress;
+gzip_level   = double(p.Results.GzipLevel);
+zstd_level   = double(p.Results.ZstdLevel);
+verbose      = p.Results.Verbose;
+autoscale    = p.Results.AutoScale;
+
+% Resolve compression mode. CompressMode wins; otherwise legacy Compress flag.
+if isempty(compress_mode)
+    if compress, compress_mode = 'zstd'; else, compress_mode = 'none'; end
+end
 
 if ~isfile(in_fname)
     error('convert_EDF:FileNotFound', 'EDF file not found: %s', in_fname);
@@ -60,11 +88,14 @@ end
 % --- Default output name --------------------------------------------------
 if isempty(out_name)
     [dir_, base, ext] = fileparts(in_fname);
-    if strcmpi(ext, '.gz')
+    if strcmpi(ext, '.gz') || strcmpi(ext, '.zst')
         [~, base, ~] = fileparts(base);  % strip the .edf
     end
-    out_ext = '.edf.gz';
-    if ~compress, out_ext = '.edf'; end
+    switch compress_mode
+        case 'gzip', out_ext = '.edf.gz';
+        case 'zstd', out_ext = '.edf.zst';
+        otherwise,   out_ext = '.edf';
+    end
     out_name = fullfile(dir_, sprintf('%s_%dHz%s', base, round(target_rate), out_ext));
 end
 
@@ -159,7 +190,8 @@ header.num_data_records = min_records;
 
 % --- Write -----------------------------------------------------------------
 write_EDF(out_name, header, new_signal_header, new_signal_cell, annotations, ...
-          'Verbose', verbose, 'AutoScale', autoscale);
+          'Verbose', verbose, 'AutoScale', autoscale, ...
+          'GzipLevel', gzip_level, 'ZstdLevel', zstd_level);
 
 out_path = out_name;
 end

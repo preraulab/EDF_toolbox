@@ -1,12 +1,13 @@
 function varargout = read_EDF(edf_fname, varargin)
-%READ_EDF  Load EDF / EDF+ / EDF.gz file with full metadata, annotations, and MEX acceleration
+%READ_EDF  Load EDF / EDF+ / EDF.gz / EDF.zst file with full metadata, annotations, and MEX acceleration
 %
 %   READ_EDF reads European Data Format (EDF / EDF+) files using a compiled
 %   MEX reader when available, and a pure MATLAB fallback otherwise. Plain
-%   '.edf' and gzip-compressed '.edf.gz' files are both accepted; compressed
-%   files are streamed directly through zlib with no temp file. The function
-%   provides full access to header metadata, per-signal scaling (digital-to-
-%   physical conversion), and EDF+ annotations.
+%   '.edf', gzip-compressed '.edf.gz', and zstd-compressed '.edf.zst' files
+%   are all accepted; compressed files are streamed directly through zlib
+%   or libzstd with no temp file (MEX path). The function provides full
+%   access to header metadata, per-signal scaling (digital-to-physical
+%   conversion), and EDF+ annotations.
 %
 %   Usage:
 %       [header, signal_header, signal_cell, annotations] = read_EDF(filename, 'Channels', {'EEG Fpz-Cz'})
@@ -87,19 +88,22 @@ force_matlab    = p.Results.forceMATLAB;
 debug           = p.Results.debug;
 deidentify      = p.Results.deidentify;
 
-%% ---------------- GZ INPUT GATING ----------------
+%% ---------------- COMPRESSED INPUT GATING ----------------
 % RepairHeader and deidentify both require modifying the file in place,
-% which is not meaningful on a gzip archive. Force them off and warn.
-is_gz = endsWith(edf_fname, '.gz', 'IgnoreCase', true);
-if is_gz
+% which is not meaningful on a compressed archive. Force them off and warn.
+is_gz  = endsWith(edf_fname, '.gz',  'IgnoreCase', true);
+is_zst = endsWith(edf_fname, '.zst', 'IgnoreCase', true);
+is_compressed = is_gz || is_zst;
+if is_compressed
+    suffix = '.gz'; if is_zst, suffix = '.zst'; end
     if repair_header
-        warning('read_EDF:RepairOnGz', ...
-            'RepairHeader is not supported for .gz inputs; in-memory header will still be corrected.');
+        warning('read_EDF:RepairOnCompressed', ...
+            'RepairHeader is not supported for %s inputs; in-memory header will still be corrected.', suffix);
         repair_header = false;
     end
     if deidentify
-        warning('read_EDF:DeidentifyOnGz', ...
-            'deidentify is not supported for .gz inputs; decompress to .edf first if you need a deidentified copy.');
+        warning('read_EDF:DeidentifyOnCompressed', ...
+            'deidentify is not supported for %s inputs; decompress to .edf first if you need a deidentified copy.', suffix);
         deidentify = false;
     end
 end
@@ -157,18 +161,34 @@ end
 % =========================================================================
 function varargout = read_EDF_matlab(edf_fname, channels, epochs, verbose, repair_header, deidentify)
 
-% If input is .gz, decompress to a temp .edf and run the rest against it.
-% Temp directory is removed when this function returns.
-gz_cleanup = []; %#ok<NASGU>
+% If input is compressed, decompress to a temp .edf and run the rest
+% against it. Temp directory is removed when this function returns.
+comp_cleanup = []; %#ok<NASGU>
 if endsWith(edf_fname, '.gz', 'IgnoreCase', true)
     if verbose
         fprintf('Decompressing %s to temp file for MATLAB reader...\n', edf_fname);
     end
     tmpdir = tempname;
     mkdir(tmpdir);
-    gz_cleanup = onCleanup(@() rmdir(tmpdir, 's'));
+    comp_cleanup = onCleanup(@() rmdir(tmpdir, 's'));
     gunzipped = gunzip(edf_fname, tmpdir);
     edf_fname = gunzipped{1};
+elseif endsWith(edf_fname, '.zst', 'IgnoreCase', true)
+    if verbose
+        fprintf('Decompressing %s to temp file for MATLAB reader...\n', edf_fname);
+    end
+    tmpdir = tempname;
+    mkdir(tmpdir);
+    comp_cleanup = onCleanup(@() rmdir(tmpdir, 's'));
+    [~, base, ~] = fileparts(edf_fname);   % strip .zst -> base.edf
+    out_path = fullfile(tmpdir, base);
+    cmd = sprintf('zstd -q -d -f -o %s %s', shell_quote(out_path), shell_quote(edf_fname));
+    [rc, msg] = system(cmd);
+    if rc ~= 0
+        error('read_EDF:ZstdDecompress', ...
+            'zstd command failed for %s: %s', edf_fname, strtrim(msg));
+    end
+    edf_fname = out_path;
 end
 
 fid = fopen(edf_fname, 'r', 'ieee-le');
@@ -611,4 +631,11 @@ while idx <= length(data)
     end
     idx = idx + 1;
 end
+end
+
+%% =========================================================================
+%  SHELL QUOTING (POSIX, for system() calls)
+% =========================================================================
+function s = shell_quote(s)
+s = ['''' strrep(s, '''', '''\''''') ''''];
 end

@@ -1,26 +1,29 @@
 /**
  * READ_EDF_MEX  High-performance EDF / EDF+ file reader for MATLAB
  *
- * Supports plain .edf and gzip-compressed .edf.gz inputs. Compressed files
- * are decoded on the fly via zlib — no temp file is created. Reads stream
- * record-by-record, so peak memory is one record's worth of raw bytes plus
- * the per-signal output arrays.
+ * Supports plain .edf, gzip-compressed .edf.gz, and zstd-compressed
+ * .edf.zst inputs. Compressed files are decoded on the fly via zlib /
+ * libzstd — no temp file is created. Reads stream record-by-record, so
+ * peak memory is one record's worth of raw bytes plus the per-signal
+ * output arrays.
  *
  * MATLAB usage:
  *   [header, sigheader, data, annotations] =
  *       read_EDF_mex(filename, channels, epochs, verbose, repair, debug)
  *
  * Compilation:
- *   mex -O -largeArrayDims read_EDF_mex.c -lz
+ *   mex -O -largeArrayDims read_EDF_mex.c -lz -lzstd
  *
  *   -largeArrayDims is REQUIRED.
  *   -lz links against system zlib (present on macOS via the Xcode SDK and
- *   on most Linux distributions).
+ *   on most Linux distributions). -lzstd links against libzstd (Homebrew
+ *   on macOS, libzstd-dev on Linux). compile_edf_mex.m wires up the
+ *   include/library paths automatically.
  *
- * Notes on .gz:
- *   • RepairHeader is silently skipped for .gz inputs — we cannot rewrite
- *     a single byte of a gzip archive in place. The header is still
- *     corrected in the returned struct.
+ * Notes on compressed inputs:
+ *   • RepairHeader is silently skipped for .gz / .zst inputs — we cannot
+ *     rewrite a single byte of a compressed archive in place. The header
+ *     is still corrected in the returned struct.
  *   • num_data_records reported in the EDF main header is trusted for
  *     header-only calls (nargout == 1). When data is requested, the actual
  *     record count is determined by streaming and the header is updated.
@@ -33,6 +36,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <zlib.h>
+#include <zstd.h>
 
 #if defined(MX_COMPAT_32)
 #error "This MEX requires -largeArrayDims"
@@ -54,69 +58,162 @@ static int g_debug = 0;
  *                         IO ABSTRACTION
  * ============================================================
  *
- * Wraps either a plain FILE* or a zlib gzFile so the rest of the
- * code reads identically. Detect .gz by file extension on open.
+ * Wraps a plain FILE*, a zlib gzFile, or a zstd streaming decoder so
+ * the rest of the code reads identically. Compression is detected from
+ * the file extension on open (.gz -> zlib, .zst -> zstd, else plain).
  */
 
+typedef enum { COMP_NONE = 0, COMP_GZ = 1, COMP_ZSTD = 2 } CompType;
+
 typedef struct {
-    int     is_gz;
-    FILE   *fp;
+    CompType comp;
+    FILE   *fp;            /* used for plain reads, and as raw source for zstd */
     gzFile  gz;
+
+    /* zstd streaming state (only used when comp == COMP_ZSTD) */
+    ZSTD_DStream *zds;
+    unsigned char *z_in_buf;     /* compressed bytes read from fp */
+    size_t        z_in_cap;
+    ZSTD_inBuffer z_in;
+    unsigned char *z_out_buf;    /* decompressed bytes ready for caller */
+    size_t        z_out_cap;
+    ZSTD_outBuffer z_out;
+    size_t        z_out_consumed; /* bytes already returned from z_out_buf */
+    int           z_eof;
 } EDFReader;
 
-static int has_gz_suffix(const char *fname)
+static CompType detect_comp(const char *fname)
 {
     size_t n = strlen(fname);
-    if (n < 3) return 0;
-    return (tolower((unsigned char)fname[n-3]) == '.' &&
-            tolower((unsigned char)fname[n-2]) == 'g' &&
-            tolower((unsigned char)fname[n-1]) == 'z');
+    if (n >= 3 &&
+        fname[n-3] == '.' &&
+        tolower((unsigned char)fname[n-2]) == 'g' &&
+        tolower((unsigned char)fname[n-1]) == 'z')
+        return COMP_GZ;
+    if (n >= 4 &&
+        fname[n-4] == '.' &&
+        tolower((unsigned char)fname[n-3]) == 'z' &&
+        tolower((unsigned char)fname[n-2]) == 's' &&
+        tolower((unsigned char)fname[n-1]) == 't')
+        return COMP_ZSTD;
+    return COMP_NONE;
 }
 
 static int edfr_open(EDFReader *r, const char *fname)
 {
-    r->fp = NULL;
-    r->gz = NULL;
-    r->is_gz = has_gz_suffix(fname);
+    memset(r, 0, sizeof(*r));
+    r->comp = detect_comp(fname);
 
-    if (r->is_gz) {
+    if (r->comp == COMP_GZ) {
         r->gz = gzopen(fname, "rb");
         return (r->gz != NULL);
-    } else {
-        r->fp = fopen(fname, "rb");
-        return (r->fp != NULL);
     }
+    if (r->comp == COMP_ZSTD) {
+        r->fp = fopen(fname, "rb");
+        if (!r->fp) return 0;
+        r->zds = ZSTD_createDStream();
+        if (!r->zds) { fclose(r->fp); r->fp = NULL; return 0; }
+        ZSTD_initDStream(r->zds);
+        r->z_in_cap  = ZSTD_DStreamInSize();
+        r->z_out_cap = ZSTD_DStreamOutSize();
+        r->z_in_buf  = (unsigned char*)malloc(r->z_in_cap);
+        r->z_out_buf = (unsigned char*)malloc(r->z_out_cap);
+        if (!r->z_in_buf || !r->z_out_buf) return 0;
+        r->z_in.src  = r->z_in_buf; r->z_in.size = 0; r->z_in.pos = 0;
+        r->z_out.dst = r->z_out_buf; r->z_out.size = r->z_out_cap; r->z_out.pos = 0;
+        r->z_out_consumed = 0;
+        r->z_eof = 0;
+        return 1;
+    }
+    r->fp = fopen(fname, "rb");
+    return (r->fp != NULL);
 }
 
 static void edfr_close(EDFReader *r)
 {
-    if (r->is_gz) {
+    if (r->comp == COMP_GZ) {
         if (r->gz) { gzclose(r->gz); r->gz = NULL; }
+    } else if (r->comp == COMP_ZSTD) {
+        if (r->zds) { ZSTD_freeDStream(r->zds); r->zds = NULL; }
+        if (r->z_in_buf)  { free(r->z_in_buf);  r->z_in_buf  = NULL; }
+        if (r->z_out_buf) { free(r->z_out_buf); r->z_out_buf = NULL; }
+        if (r->fp) { fclose(r->fp); r->fp = NULL; }
     } else {
         if (r->fp) { fclose(r->fp); r->fp = NULL; }
     }
 }
 
+/* Pull more decompressed bytes into r->z_out_buf. Returns 1 if any are
+ * available afterward, 0 on clean EOF, -1 on error. */
+static int zstd_refill(EDFReader *r)
+{
+    /* If output buffer fully consumed, reset. */
+    if (r->z_out_consumed >= r->z_out.pos) {
+        r->z_out.pos = 0;
+        r->z_out_consumed = 0;
+    }
+    while (r->z_out_consumed >= r->z_out.pos) {
+        /* Need to decompress. Refill input if exhausted. */
+        if (r->z_in.pos >= r->z_in.size && !r->z_eof) {
+            size_t got = fread(r->z_in_buf, 1, r->z_in_cap, r->fp);
+            r->z_in.src  = r->z_in_buf;
+            r->z_in.size = got;
+            r->z_in.pos  = 0;
+            if (got == 0) r->z_eof = 1;
+        }
+        if (r->z_in.pos >= r->z_in.size && r->z_eof) {
+            return 0;  /* clean EOF */
+        }
+        /* Decompress some of input into out buffer. */
+        r->z_out.pos = 0;
+        r->z_out_consumed = 0;
+        size_t ret = ZSTD_decompressStream(r->zds, &r->z_out, &r->z_in);
+        if (ZSTD_isError(ret)) {
+            mexPrintf("zstd decompress error: %s\n", ZSTD_getErrorName(ret));
+            return -1;
+        }
+        if (r->z_out.pos > 0) return 1;
+        /* No output produced this iteration; loop refills input or hits EOF. */
+    }
+    return 1;
+}
+
 /* Returns number of bytes actually read (0 on EOF or error). */
 static size_t edfr_read(EDFReader *r, void *buf, size_t n)
 {
-    if (r->is_gz) {
+    if (r->comp == COMP_GZ) {
         int got = gzread(r->gz, buf, (unsigned)n);
         if (got <= 0) return 0;
         return (size_t)got;
-    } else {
-        return fread(buf, 1, n, r->fp);
     }
+    if (r->comp == COMP_ZSTD) {
+        size_t total = 0;
+        while (total < n) {
+            int rc = zstd_refill(r);
+            if (rc <= 0) break;
+            size_t avail = r->z_out.pos - r->z_out_consumed;
+            size_t want  = n - total;
+            size_t take  = avail < want ? avail : want;
+            memcpy((unsigned char*)buf + total,
+                   r->z_out_buf + r->z_out_consumed, take);
+            r->z_out_consumed += take;
+            total += take;
+        }
+        return total;
+    }
+    return fread(buf, 1, n, r->fp);
 }
 
-/* Absolute seek from start of (uncompressed) stream. */
+/* Absolute seek from start of (uncompressed) stream. Plain only. */
 static int edfr_seek_set(EDFReader *r, mwSize off)
 {
-    if (r->is_gz) {
+    if (r->comp == COMP_GZ) {
         return (gzseek(r->gz, (z_off_t)off, SEEK_SET) >= 0);
-    } else {
-        return (fseek(r->fp, (long)off, SEEK_SET) == 0);
     }
+    if (r->comp == COMP_ZSTD) {
+        return 0;  /* no seek support for zstd streams */
+    }
+    return (fseek(r->fp, (long)off, SEEK_SET) == 0);
 }
 
 /* ============================================================
@@ -480,7 +577,9 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 
     DBG("\n===== INPUT =====\n");
     DBG("File: %s\n", fname);
-    DBG("Compressed: %s\n", rd.is_gz ? "yes (.gz)" : "no");
+    DBG("Compressed: %s\n",
+        rd.comp == COMP_GZ   ? "yes (.gz)" :
+        rd.comp == COMP_ZSTD ? "yes (.zst)" : "no");
     DBG("=================\n\n");
 
     /* ============================================================
@@ -538,10 +637,11 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 
     int repair = (nrhs > 4 && mxGetScalar(prhs[4]) != 0);
 
-    if (rd.is_gz) {
+    if (rd.comp != COMP_NONE) {
         if (repair && verbose)
-            mexPrintf("RepairHeader requested but file is gzipped — "
-                      "skipping on-disk repair.\n");
+            mexPrintf("RepairHeader requested but file is compressed (%s) — "
+                      "skipping on-disk repair.\n",
+                      rd.comp == COMP_GZ ? ".gz" : ".zst");
     } else {
         fix_num_records_plain(&rd, &hdr, sig, fname, verbose, repair);
     }

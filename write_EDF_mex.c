@@ -2,21 +2,26 @@
  * WRITE_EDF_MEX  High-performance EDF / EDF+ writer for MATLAB
  *
  * Mirror of read_EDF_mex.c. Streams records one at a time and supports
- * gzip output (.edf.gz) on the fly via vendored zlib.
+ * gzip (.edf.gz) and zstd (.edf.zst) output on the fly via zlib /
+ * libzstd. No temp file is created.
  *
  * MATLAB usage:
  *   write_EDF_mex(filename, header, signal_header, signal_cell, annotations,
- *                 autoscale_mode, verbose, debug)
+ *                 autoscale_mode, verbose, debug, gzip_level, zstd_level)
  *
  *     autoscale_mode : 0 = preserve (use existing physical_min/max, clip)
  *                      1 = recompute (set physical_min/max from data)
+ *     gzip_level     : zlib compression level 1..9 for .gz outputs
+ *                      (default 6; ignored unless filename ends in .gz)
+ *     zstd_level     : zstd compression level 1..22 for .zst outputs
+ *                      (default 3; ignored unless filename ends in .zst)
  *
  *   The MATLAB side validates inputs before calling. Channels and signal
  *   headers must be consistent (every non-annotation signal must have
  *   length == samples_in_record * num_data_records).
  *
  * Compilation:
- *   mex -O -largeArrayDims -Izlib write_EDF_mex.c zlib/(asterisk).c
+ *   mex -O -largeArrayDims -Izlib write_EDF_mex.c zlib/(asterisk).c -lzstd
  */
 
 #include "mex.h"
@@ -27,6 +32,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <zlib.h>
+#include <zstd.h>
 
 #if defined(MX_COMPAT_32)
 #error "This MEX requires -largeArrayDims"
@@ -39,55 +45,132 @@ static int g_debug = 0;
 
 /* ============================================================
  *                      WRITER IO ABSTRACTION
- * ============================================================ */
+ * ============================================================
+ *
+ * Three output modes selected by filename suffix:
+ *   .gz   -> gzip via zlib gzopen, with caller-supplied level
+ *   .zst  -> zstd streaming compression, with caller-supplied level
+ *   else  -> plain fwrite
+ */
+
+typedef enum { COMP_NONE = 0, COMP_GZ = 1, COMP_ZSTD = 2 } CompType;
 
 typedef struct {
-    int     is_gz;
-    FILE   *fp;
+    CompType comp;
+    FILE   *fp;            /* used for plain writes; also raw sink for zstd */
     gzFile  gz;
+
+    /* zstd streaming state */
+    ZSTD_CStream *zcs;
+    unsigned char *z_out_buf;
+    size_t        z_out_cap;
 } EDFWriter;
 
-static int has_gz_suffix(const char *fname)
+static CompType detect_comp(const char *fname)
 {
     size_t n = strlen(fname);
-    if (n < 3) return 0;
-    return (tolower((unsigned char)fname[n-3]) == '.' &&
-            tolower((unsigned char)fname[n-2]) == 'g' &&
-            tolower((unsigned char)fname[n-1]) == 'z');
+    if (n >= 3 &&
+        fname[n-3] == '.' &&
+        tolower((unsigned char)fname[n-2]) == 'g' &&
+        tolower((unsigned char)fname[n-1]) == 'z')
+        return COMP_GZ;
+    if (n >= 4 &&
+        fname[n-4] == '.' &&
+        tolower((unsigned char)fname[n-3]) == 'z' &&
+        tolower((unsigned char)fname[n-2]) == 's' &&
+        tolower((unsigned char)fname[n-1]) == 't')
+        return COMP_ZSTD;
+    return COMP_NONE;
 }
 
-static int edfw_open(EDFWriter *w, const char *fname)
+static int edfw_open(EDFWriter *w, const char *fname,
+                     int gzip_level, int zstd_level)
 {
-    w->fp = NULL;
-    w->gz = NULL;
-    w->is_gz = has_gz_suffix(fname);
+    memset(w, 0, sizeof(*w));
+    w->comp = detect_comp(fname);
 
-    if (w->is_gz) {
-        w->gz = gzopen(fname, "wb");
+    if (w->comp == COMP_GZ) {
+        char mode[8];
+        if (gzip_level < 1) gzip_level = 1;
+        if (gzip_level > 9) gzip_level = 9;
+        snprintf(mode, sizeof(mode), "wb%d", gzip_level);
+        w->gz = gzopen(fname, mode);
         return (w->gz != NULL);
-    } else {
-        w->fp = fopen(fname, "wb");
-        return (w->fp != NULL);
     }
+    if (w->comp == COMP_ZSTD) {
+        w->fp = fopen(fname, "wb");
+        if (!w->fp) return 0;
+        w->zcs = ZSTD_createCStream();
+        if (!w->zcs) { fclose(w->fp); w->fp = NULL; return 0; }
+        if (zstd_level < 1)  zstd_level = 1;
+        if (zstd_level > 22) zstd_level = 22;
+        size_t ret = ZSTD_initCStream(w->zcs, zstd_level);
+        if (ZSTD_isError(ret)) {
+            ZSTD_freeCStream(w->zcs); w->zcs = NULL;
+            fclose(w->fp); w->fp = NULL;
+            return 0;
+        }
+        w->z_out_cap = ZSTD_CStreamOutSize();
+        w->z_out_buf = (unsigned char*)malloc(w->z_out_cap);
+        if (!w->z_out_buf) {
+            ZSTD_freeCStream(w->zcs); w->zcs = NULL;
+            fclose(w->fp); w->fp = NULL;
+            return 0;
+        }
+        return 1;
+    }
+    w->fp = fopen(fname, "wb");
+    return (w->fp != NULL);
 }
 
 static int edfw_write(EDFWriter *w, const void *buf, size_t n)
 {
-    if (w->is_gz) {
+    if (w->comp == COMP_GZ) {
         int put = gzwrite(w->gz, buf, (unsigned)n);
         return (put == (int)n);
-    } else {
-        return (fwrite(buf, 1, n, w->fp) == n);
     }
+    if (w->comp == COMP_ZSTD) {
+        ZSTD_inBuffer in = { buf, n, 0 };
+        while (in.pos < in.size) {
+            ZSTD_outBuffer out = { w->z_out_buf, w->z_out_cap, 0 };
+            size_t ret = ZSTD_compressStream2(w->zcs, &out, &in, ZSTD_e_continue);
+            if (ZSTD_isError(ret)) {
+                mexPrintf("zstd compress error: %s\n", ZSTD_getErrorName(ret));
+                return 0;
+            }
+            if (out.pos > 0 &&
+                fwrite(w->z_out_buf, 1, out.pos, w->fp) != out.pos)
+                return 0;
+        }
+        return 1;
+    }
+    return (fwrite(buf, 1, n, w->fp) == n);
 }
 
 static void edfw_close(EDFWriter *w)
 {
-    if (w->is_gz) {
+    if (w->comp == COMP_GZ) {
         if (w->gz) { gzclose(w->gz); w->gz = NULL; }
-    } else {
-        if (w->fp) { fclose(w->fp); w->fp = NULL; }
+        return;
     }
+    if (w->comp == COMP_ZSTD) {
+        if (w->zcs && w->fp) {
+            ZSTD_inBuffer in = { NULL, 0, 0 };
+            size_t rem;
+            do {
+                ZSTD_outBuffer out = { w->z_out_buf, w->z_out_cap, 0 };
+                rem = ZSTD_compressStream2(w->zcs, &out, &in, ZSTD_e_end);
+                if (out.pos > 0)
+                    fwrite(w->z_out_buf, 1, out.pos, w->fp);
+                if (ZSTD_isError(rem)) break;
+            } while (rem > 0);
+        }
+        if (w->zcs)        { ZSTD_freeCStream(w->zcs); w->zcs = NULL; }
+        if (w->z_out_buf)  { free(w->z_out_buf); w->z_out_buf = NULL; }
+        if (w->fp)         { fclose(w->fp); w->fp = NULL; }
+        return;
+    }
+    if (w->fp) { fclose(w->fp); w->fp = NULL; }
 }
 
 /* ============================================================
@@ -246,6 +329,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     int autoscale_mode = (nrhs > 5) ? (int)mxGetScalar(prhs[5]) : 0;
     int verbose        = (nrhs > 6) ? (int)mxGetScalar(prhs[6]) : 0;
     g_debug            = (nrhs > 7) ? (int)mxGetScalar(prhs[7]) : 0;
+    int gzip_level     = (nrhs > 8) ? (int)mxGetScalar(prhs[8]) : 6;
+    int zstd_level     = (nrhs > 9) ? (int)mxGetScalar(prhs[9]) : 3;
 
     if (!mxIsStruct(m_hdr))
         mexErrMsgIdAndTxt("write_EDF_mex:Input", "header must be a struct");
@@ -378,7 +463,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     int num_header_bytes = EDF_HEADER_SIZE * (1 + num_signals);
 
     EDFWriter w;
-    if (!edfw_open(&w, fname))
+    if (!edfw_open(&w, fname, gzip_level, zstd_level))
         mexErrMsgIdAndTxt("write_EDF_mex:File", "Cannot open '%s' for writing", fname);
 
     /* ------ Main 256-byte header ------ */
@@ -583,5 +668,6 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 
     if (verbose) mexPrintf("write_EDF_mex: done (%d signals, %llu records, %s)\n",
                            num_signals, (unsigned long long)num_records,
-                           w.is_gz ? ".edf.gz" : ".edf");
+                           w.comp == COMP_GZ   ? ".edf.gz" :
+                           w.comp == COMP_ZSTD ? ".edf.zst" : ".edf");
 }
