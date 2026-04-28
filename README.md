@@ -1,15 +1,32 @@
 # read_EDF
 
-High-performance EDF / EDF+ reader for MATLAB, with a compiled MEX backend and a pure-MATLAB fallback. Reads plain `.edf` and gzip-compressed `.edf.gz` (on the fly, no temp file).
+High-performance EDF / EDF+ reader **and writer** for MATLAB, with compiled MEX backends and pure-MATLAB fallbacks. Reads and writes plain `.edf` and gzip-compressed `.edf.gz` (on the fly, no temp file). Bundled with `convert_EDF` (read → resample → write) and `batch_convert_EDF` (parallel multi-file pipeline), plus a `bin/convert_edf` shell CLI.
 
-Handles the things that break off-the-shelf EDF readers in practice: malformed record counts in clinical files, EDF+ TAL annotations, A-B rereferencing at load time, de-identification, compressed archives, and large polysomnography recordings where a naive loop is slow.
+Handles the things that break off-the-shelf EDF readers in practice: malformed record counts in clinical files, EDF+ TAL annotations, A-B rereferencing at load time, de-identification, compressed archives, anti-aliased resampling, and large polysomnography recordings where a naive loop is slow.
 
 Part of the Prerau Lab [`preraulab_utilities`](https://github.com/preraulab/preraulab_utilities) meta-repository. Can also be used standalone.
 
 ## Quick start
 
 ```matlab
+% Read
 [header, signal_header, signal_cell, annotations] = read_EDF('sleep.edf');
+
+% Write (mirror of read_EDF; ends-in-.gz triggers gzip)
+write_EDF('sleep_copy.edf.gz', header, signal_header, signal_cell, annotations);
+
+% Read → resample to 128 Hz → write (gzipped, anti-aliased)
+convert_EDF('sleep.edf', 128);
+% writes sleep_128Hz.edf.gz next to the input
+
+% Batch a directory of EDFs, parallel
+result = batch_convert_EDF('/path/to/edfs', 128, 'OutputDir', '/path/out');
+```
+
+From the shell:
+
+```sh
+bin/convert_edf -r 128 -o /path/out /path/to/edfs
 ```
 
 - `header` — struct with main-header metadata (patient ID, record duration, start date/time, etc.)
@@ -31,7 +48,11 @@ Part of the Prerau Lab [`preraulab_utilities`](https://github.com/preraulab/prer
 | **Header repair** | Correct invalid `num_data_records` and save a `_fixed` copy (plain `.edf` only) |
 | **De-identification** | Strip PHI fields and save a `_deidentified` copy (plain `.edf` only) |
 | **Digital → physical scaling** | `phys_val = phys_min + (dig_val - dig_min) × (phys_max - phys_min) / (dig_max - dig_min)` — done correctly per-channel |
-| **Streaming I/O** | Reads record-by-record; peak memory is ~one record + the output arrays, even for multi-GB files |
+| **Streaming I/O** | Reads and writes record-by-record; peak memory is ~one record + the output arrays, even for multi-GB files |
+| **Write side** | `write_EDF` mirrors `read_EDF`; same struct shapes round-trip through `read → write → read` to within ~1 digital LSB |
+| **Resample pipeline** | `convert_EDF` reads, resamples every channel to a target rate (anti-aliased Kaiser FIR via SPT `resample`), and writes — optionally gzipped |
+| **Parallel batch** | `batch_convert_EDF` runs `convert_EDF` over a list/dir/cell of files via `parfor`; per-file errors don't abort the batch |
+| **Shell CLI** | `bin/convert_edf` — POSIX shell wrapper, single `matlab -batch` invocation per call |
 
 ## Usage
 
@@ -93,6 +114,70 @@ Clinical EDFs sometimes have invalid `num_data_records` — the field says one n
 [~, ~, s] = read_EDF('f.edf', 'forceMATLAB', true);
 ```
 
+### Write an EDF
+
+```matlab
+% Round-trip
+[h, sh, sc, ann] = read_EDF('in.edf');
+write_EDF('out.edf', h, sh, sc, ann);
+
+% Compressed output
+write_EDF('out.edf.gz', h, sh, sc, ann);
+
+% AutoScale: 'preserve' (default) keeps physical_min/max and clips data to fit
+%            'recompute' sets physical_min/max from the data
+write_EDF('out.edf', h, sh, sc, [], 'AutoScale', 'recompute');
+```
+
+The default `'preserve'` mode is required for lossless `read → write → read` round-trip; round-tripped signals match the originals to within one digital LSB per channel.
+
+### Resample one EDF (read → resample → write)
+
+```matlab
+% Default: writes sleep_128Hz.edf.gz next to the input
+convert_EDF('sleep.edf', 128);
+
+% Custom output, no compression
+convert_EDF('sleep.edf', 128, 'OutputName', '/tmp/out.edf', 'Compress', false);
+```
+
+Resampling uses SPT's `resample` (Kaiser-windowed sinc FIR, anti-aliased). The annotation channel is preserved; only signal channels are resampled. `target_rate * data_record_duration` must be an integer (the writer needs an integer `samples_in_record`); the function errors with the closest valid alternative if not.
+
+### Batch many EDFs
+
+```matlab
+% Cell array of explicit paths
+result = batch_convert_EDF({'a.edf', 'b.edf'}, 128, ...
+    'OutputDir', '/path/out', 'Parallel', true);
+
+% Whole directory
+result = batch_convert_EDF('/path/in', 128, 'Pattern', '*.edf');
+
+% Text file with one path per line (.txt or .list)
+result = batch_convert_EDF('list.txt', 128);
+```
+
+`result` is a table with columns `input`, `output`, `status` (`'ok'`/`'failed'`), `elapsed_s`, `error_message`. Per-file failures don't abort the batch.
+
+### Shell CLI
+
+`bin/convert_edf` is a POSIX shell wrapper for `batch_convert_EDF`. It auto-detects `matlab` on `$PATH` (or in standard install locations on macOS/Linux), invokes a single `matlab -batch`, and exits non-zero if any file failed.
+
+```sh
+bin/convert_edf --help
+
+# Single file
+bin/convert_edf -r 128 sleep.edf
+
+# A whole directory, custom output dir
+bin/convert_edf -r 128 -o /path/out /path/in
+
+# Disable gzip and parfor; run quietly
+bin/convert_edf -r 128 --no-gzip --no-parallel /path/file.edf
+```
+
+The CLI shells out to MATLAB once per invocation — startup cost (~10 s) is amortized across the whole batch, which is why a single `convert_edf` call across many files is much faster than scripting per-file invocations.
+
 ### Inspect the header in a GUI
 
 ```matlab
@@ -117,17 +202,25 @@ Clinical EDFs sometimes have invalid `num_data_records` — the field says one n
 
 | File | Role |
 |---|---|
-| `read_EDF.m` | Main entry point — dispatches to MEX or pure-MATLAB, handles rereferencing, annotations, gz decompression |
-| `read_EDF_mex.c` | C source for the MEX accelerator (uses bundled zlib for `.edf.gz`) |
-| `read_EDF_mex.mexmaca64` | Pre-built MEX binary for Apple Silicon |
-| `zlib/` | Vendored zlib 1.3.2 source (BSD-style license). Compiled into the MEX so there's no system zlib dependency on any platform. |
+| `read_EDF.m` | Read entry point — dispatches to MEX or pure-MATLAB, handles rereferencing, annotations, gz decompression |
+| `read_EDF_mex.c` | C source for the read MEX accelerator |
+| `read_EDF_mex.mexmaca64` | Pre-built read MEX for Apple Silicon |
+| `write_EDF.m` | Write entry point — mirror of read_EDF (gz-aware, MEX + MATLAB fallback) |
+| `write_EDF_mex.c` | C source for the write MEX accelerator |
+| `write_EDF_mex.mexmaca64` | Pre-built write MEX for Apple Silicon |
+| `convert_EDF.m` | Read → resample → write helper (one file) |
+| `batch_convert_EDF.m` | Multi-file driver with `parfor` and per-file error handling |
+| `bin/convert_edf` | POSIX shell wrapper for `batch_convert_EDF` |
+| `compile_edf_mex.m` | Shared auto-compile helper (vendored zlib build) |
+| `zlib/` | Vendored zlib 1.3.2 source (BSD-style license). Compiled into both MEX files so there's no system zlib dependency on any platform. |
 | `header_gui.m` | Optional UI for inspecting header + signal-header tables |
 
-If a pre-built MEX isn't available for your platform (Linux, Windows), `read_EDF.m` will auto-compile on first call. The build pulls in the vendored zlib, so it works the same on macOS, Linux, and Windows with no system dependencies. To rebuild manually:
+If a pre-built MEX isn't available for your platform (Linux, Windows), `read_EDF.m` and `write_EDF.m` will auto-compile on first call. The build pulls in the vendored zlib, so it works the same on macOS, Linux, and Windows with no system dependencies. To rebuild manually:
 
 ```matlab
 % From the read_EDF directory
-mex -O -largeArrayDims -Izlib read_EDF_mex.c zlib/*.c
+mex -O -largeArrayDims -Izlib read_EDF_mex.c  zlib/*.c
+mex -O -largeArrayDims -Izlib write_EDF_mex.c zlib/*.c
 ```
 
 ## Install

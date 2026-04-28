@@ -111,7 +111,7 @@ mex_exists = isfile(mex_file);
 
 if ~force_matlab
     if ~mex_exists
-        compile_read_EDF_mex(script_dir);
+        compile_edf_mex(script_dir, 'read_EDF_mex.c');
     end
     try
         [varargout{1:nargout}] = read_EDF_mex(edf_fname, channels, epochs, verbose, repair_header, debug);
@@ -149,27 +149,6 @@ end
 %% ---------------- MATLAB FALLBACK ----------------
 [varargout{1:nargout}] = read_EDF_matlab(edf_fname, channels, epochs, verbose, repair_header, deidentify);
 
-end
-
-
-%% =========================================================================
-%  COMPILE HELPER — vendored zlib build, with system -lz fallback
-% =========================================================================
-function compile_read_EDF_mex(script_dir)
-zlib_dir = fullfile(script_dir, 'zlib');
-mex_src  = fullfile(script_dir, 'read_EDF_mex.c');
-
-if isfolder(zlib_dir)
-    disp('Compiling read_EDF_mex with bundled zlib...');
-    zlib_files = dir(fullfile(zlib_dir, '*.c'));
-    zlib_paths = arrayfun(@(f) fullfile(f.folder, f.name), zlib_files, ...
-        'UniformOutput', false);
-    args = [{'-O', '-largeArrayDims', ['-I' zlib_dir], mex_src}, zlib_paths(:)'];
-    mex(args{:});
-else
-    disp('Compiling read_EDF_mex with system zlib (-lz)...');
-    mex('-O', '-largeArrayDims', mex_src, '-lz');
-end
 end
 
 

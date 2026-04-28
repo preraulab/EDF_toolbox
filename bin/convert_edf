@@ -1,0 +1,127 @@
+#!/bin/sh
+# convert_edf — POSIX shell wrapper around batch_convert_EDF
+#
+# Resamples one or more EDF files to a uniform sample rate, optionally
+# gzipping the output. Single MATLAB invocation (startup cost amortized
+# across the batch).
+#
+# Usage: convert_edf [OPTIONS] FILE [FILE ...]
+#        convert_edf [OPTIONS] DIR
+#
+# OPTIONS
+#   -r, --rate HZ          Target rate (required)
+#   -o, --output-dir DIR   Output directory (default: alongside input)
+#       --no-gzip          Write .edf instead of .edf.gz
+#       --no-parallel      Disable parfor
+#       --pattern GLOB     Pattern when DIR is given (default: *.edf)
+#       --matlab PATH      Path to matlab binary (default: auto-detect)
+#       --autoscale MODE   preserve (default) | recompute
+#   -v, --verbose
+#   -h, --help
+#
+# Exit code: 0 if all files succeed, 1 if any fail.
+
+set -eu
+
+usage() {
+    sed -n '2,/^[^#]/p' "$0" | sed 's/^# \{0,1\}//; s/^!.*//;' | head -n 22
+}
+
+die() { echo "convert_edf: $*" >&2; exit 2; }
+
+# Defaults
+RATE=""
+OUT_DIR=""
+COMPRESS="true"
+PARALLEL="true"
+PATTERN="*.edf"
+MATLAB=""
+AUTOSCALE="preserve"
+VERBOSE="false"
+
+# Resolve script's repo root (the dir containing this script's parent's parent)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Parse args
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -r|--rate)         shift; RATE="${1:-}";;
+        -o|--output-dir)   shift; OUT_DIR="${1:-}";;
+        --no-gzip)         COMPRESS="false";;
+        --no-parallel)     PARALLEL="false";;
+        --pattern)         shift; PATTERN="${1:-}";;
+        --matlab)          shift; MATLAB="${1:-}";;
+        --autoscale)       shift; AUTOSCALE="${1:-}";;
+        -v|--verbose)      VERBOSE="true";;
+        -h|--help)         usage; exit 0;;
+        --)                shift; break;;
+        -*)                die "unknown option: $1";;
+        *)                 break;;
+    esac
+    shift
+done
+
+[ -z "$RATE" ] && { usage; echo; die "missing required --rate"; }
+[ $# -lt 1 ]  && { usage; echo; die "no input files or directory given"; }
+
+# Auto-detect MATLAB binary
+if [ -z "$MATLAB" ]; then
+    if [ -n "${MATLAB_BIN:-}" ] && [ -x "$MATLAB_BIN" ]; then
+        MATLAB="$MATLAB_BIN"
+    elif command -v matlab >/dev/null 2>&1; then
+        MATLAB="$(command -v matlab)"
+    else
+        # Try common install locations (mac, linux). Pick highest version.
+        for cand in \
+            /Applications/MATLAB_R*/bin/matlab \
+            /Applications/MATLAB_R*.app/bin/matlab \
+            /usr/local/MATLAB/R*/bin/matlab \
+            /opt/MATLAB/R*/bin/matlab; do
+            for f in $cand; do
+                [ -x "$f" ] && MATLAB="$f"
+            done
+        done
+    fi
+fi
+[ -z "$MATLAB" ] && die "could not find matlab binary; set --matlab or \$MATLAB_BIN"
+
+# Escape single quotes for MATLAB string literals.
+escape_q() { printf "%s" "$1" | sed "s/'/''/g"; }
+
+# Build the input expression — pass a directory path directly (as a string)
+# when exactly one directory is given; otherwise build a cell array of paths.
+if [ $# -eq 1 ] && [ -d "$1" ]; then
+    M_INPUT="'$(escape_q "$1")'"
+else
+    INPUTS_M=""
+    for f in "$@"; do
+        e=$(escape_q "$f")
+        if [ -z "$INPUTS_M" ]; then
+            INPUTS_M="'$e'"
+        else
+            INPUTS_M="$INPUTS_M, '$e'"
+        fi
+    done
+    M_INPUT="{$INPUTS_M}"
+fi
+
+# Build the MATLAB command. All statements separated by ';'.
+M_CMD="addpath('$(escape_q "$REPO_DIR")')"
+M_CMD="$M_CMD; opts = {}"
+[ -n "$OUT_DIR" ] && M_CMD="$M_CMD; opts = [opts, {'OutputDir','$(escape_q "$OUT_DIR")'}]"
+M_CMD="$M_CMD; opts = [opts, {'Compress', $COMPRESS}]"
+M_CMD="$M_CMD; opts = [opts, {'Parallel', $PARALLEL}]"
+M_CMD="$M_CMD; opts = [opts, {'Pattern', '$(escape_q "$PATTERN")'}]"
+M_CMD="$M_CMD; opts = [opts, {'Verbose', $VERBOSE}]"
+M_CMD="$M_CMD; opts = [opts, {'AutoScale', '$(escape_q "$AUTOSCALE")'}]"
+M_CMD="$M_CMD; t = batch_convert_EDF($M_INPUT, $RATE, opts{:})"
+M_CMD="$M_CMD; nok = sum(strcmp(t.status, 'ok'))"
+M_CMD="$M_CMD; nfail = height(t) - nok"
+M_CMD="$M_CMD; fprintf('convert_edf: %d/%d ok, %d failed\n', nok, height(t), nfail)"
+M_CMD="$M_CMD; if nfail > 0; disp(t(strcmp(t.status,'failed'), :)); end"
+M_CMD="$M_CMD; if nfail > 0; exit(1); else; exit(0); end"
+
+[ "$VERBOSE" = "true" ] && echo "convert_edf: invoking $MATLAB" >&2
+
+exec "$MATLAB" -batch "$M_CMD"
