@@ -1,44 +1,63 @@
 function varargout = read_EDF(edf_fname, varargin)
-%READ_EDF  Load EDF or EDF+ file with full metadata, annotations, and MEX acceleration
+%READ_EDF  Load EDF / EDF+ / EDF.gz file with full metadata, annotations, and MEX acceleration
 %
-%   READ_EDF reads European Data Format (EDF/EDF+) files using a compiled MEX
-%   reader when available, and a pure MATLAB fallback otherwise. The function
-%   provides full access to header metadata, per-signal_cellnal scaling (digital-to-
+%   READ_EDF reads European Data Format (EDF / EDF+) files using a compiled
+%   MEX reader when available, and a pure MATLAB fallback otherwise. Plain
+%   '.edf' and gzip-compressed '.edf.gz' files are both accepted; compressed
+%   files are streamed directly through zlib with no temp file. The function
+%   provides full access to header metadata, per-signal scaling (digital-to-
 %   physical conversion), and EDF+ annotations.
 %
 %   Usage:
 %       [header, signal_header, signal_cell, annotations] = read_EDF(filename, 'Channels', {'EEG Fpz-Cz'})
 %
 %   Inputs:
-%       edf_fname      : string - EDF or EDF+ file path
+%       edf_fname      : string - path to a .edf or .edf.gz file
 %       'Channels'     : cell array - subset of channels to read (default: all)
 %                        Use 'ChA-ChB' to load ChA minus ChB as a rereferenced channel.
 %       'Epochs'       : 1x2 vector [start_epoch end_epoch] (0-indexed, default: all)
 %       'Verbose'      : logical - print progress and status info (default: false)
-%       'RepairHeader' : logical - correct invalid record counts and save with _fixed suffix (default: false)
-%       'forceMATLAB'  : logical - disable MEX usage (default: false)
+%       'RepairHeader' : logical - correct invalid record counts and save with _fixed suffix
+%                        (default: false; ignored with a warning for .gz inputs)
+%       'forceMATLAB'  : logical - disable MEX usage (default: false). For .gz inputs
+%                        the MATLAB path decompresses to a temp file (auto-cleaned up).
 %       'debug'        : logical - debug mode for MEX (default: false)
-%       'deidentify'   : logical - overwrite PHI fields and save with _deidentified suffix (default: false)
+%       'deidentify'   : logical - overwrite PHI fields and save with _deidentified suffix
+%                        (default: false; ignored with a warning for .gz inputs)
 %
 %   Outputs:
-%       header   : structure containing EDF file-level metadata
-%       signal_header    : structure array of per-signal_cellnal headers
-%       signal_cell   : cell array containing each signal_cellnal vector (in physical units)
+%       header        : structure containing EDF file-level metadata
+%       signal_header : structure array of per-signal headers
+%       signal_cell   : cell array containing each signal vector (in physical units)
 %       annotations   : structure array of EDF+ annotations with onset and text
 %
-%   Example:
-%       [header, signal_header, signal_cell, annotations] = read_EDF('sleep.edf', 'Channels', {'EEG C3-A2'});
+%   Examples:
+%       % Plain EDF
+%       [hdr, shdr, sc, ann] = read_EDF('sleep.edf', 'Channels', {'EEG C3-A2'});
+%
+%       % Gzip-compressed EDF (streamed via zlib, no temp file)
+%       [hdr, shdr, sc, ann] = read_EDF('sleep.edf.gz');
 %
 %   -------------------------------------------------------------------------
 %   EDF File Specification Summary:
 %       • Each EDF file begins with a fixed-length 256-byte main header
-%       • Followed by per-signal_cellnal headers (16 fields × N signal_cellnals)
+%       • Followed by per-signal headers (16 fields x N signals)
 %       • Digital samples stored as int16 are scaled to physical units:
 %
 %             phys_val = phys_min + (dig_val - dig_min) * (phys_max - phys_min) / (dig_max - dig_min)
 %
 %       • EDF+ annotation channels (labelled 'EDF Annotations') contain onset
 %         times and event texts in TAL (Time-Annotation List) format.
+%
+%   -------------------------------------------------------------------------
+%   Compressed input notes:
+%       • Files ending in '.gz' (case-insensitive) are read directly through
+%         the bundled zlib (vendored in the 'zlib/' subdirectory).
+%       • Peak memory is one record's worth of raw bytes plus the per-signal
+%         output arrays — files do not need to fit decompressed on disk.
+%       • RepairHeader and deidentify both modify the file in place, which is
+%         not meaningful on a gzip archive; both are silently disabled (with a
+%         warning) for .gz inputs. Decompress to .edf first if you need either.
 
 %% ---------------- INPUT PARSING ----------------
 if nargin < 1
@@ -68,6 +87,23 @@ force_matlab    = p.Results.forceMATLAB;
 debug           = p.Results.debug;
 deidentify      = p.Results.deidentify;
 
+%% ---------------- GZ INPUT GATING ----------------
+% RepairHeader and deidentify both require modifying the file in place,
+% which is not meaningful on a gzip archive. Force them off and warn.
+is_gz = endsWith(edf_fname, '.gz', 'IgnoreCase', true);
+if is_gz
+    if repair_header
+        warning('read_EDF:RepairOnGz', ...
+            'RepairHeader is not supported for .gz inputs; in-memory header will still be corrected.');
+        repair_header = false;
+    end
+    if deidentify
+        warning('read_EDF:DeidentifyOnGz', ...
+            'deidentify is not supported for .gz inputs; decompress to .edf first if you need a deidentified copy.');
+        deidentify = false;
+    end
+end
+
 %% ---------------- MEX HANDLING ----------------
 script_dir = fileparts(mfilename('fullpath'));
 mex_file = fullfile(script_dir, ['read_EDF_mex.' mexext]);
@@ -75,8 +111,7 @@ mex_exists = isfile(mex_file);
 
 if ~force_matlab
     if ~mex_exists
-        disp('Compiling mex...')
-        mex read_EDF_mex.c -O -largeArrayDims;
+        compile_read_EDF_mex(script_dir);
     end
     try
         [varargout{1:nargout}] = read_EDF_mex(edf_fname, channels, epochs, verbose, repair_header, debug);
@@ -118,9 +153,44 @@ end
 
 
 %% =========================================================================
+%  COMPILE HELPER — vendored zlib build, with system -lz fallback
+% =========================================================================
+function compile_read_EDF_mex(script_dir)
+zlib_dir = fullfile(script_dir, 'zlib');
+mex_src  = fullfile(script_dir, 'read_EDF_mex.c');
+
+if isfolder(zlib_dir)
+    disp('Compiling read_EDF_mex with bundled zlib...');
+    zlib_files = dir(fullfile(zlib_dir, '*.c'));
+    zlib_paths = arrayfun(@(f) fullfile(f.folder, f.name), zlib_files, ...
+        'UniformOutput', false);
+    args = [{'-O', '-largeArrayDims', ['-I' zlib_dir], mex_src}, zlib_paths(:)'];
+    mex(args{:});
+else
+    disp('Compiling read_EDF_mex with system zlib (-lz)...');
+    mex('-O', '-largeArrayDims', mex_src, '-lz');
+end
+end
+
+
+%% =========================================================================
 %  PURE MATLAB EDF READER
 % =========================================================================
 function varargout = read_EDF_matlab(edf_fname, channels, epochs, verbose, repair_header, deidentify)
+
+% If input is .gz, decompress to a temp .edf and run the rest against it.
+% Temp directory is removed when this function returns.
+gz_cleanup = []; %#ok<NASGU>
+if endsWith(edf_fname, '.gz', 'IgnoreCase', true)
+    if verbose
+        fprintf('Decompressing %s to temp file for MATLAB reader...\n', edf_fname);
+    end
+    tmpdir = tempname;
+    mkdir(tmpdir);
+    gz_cleanup = onCleanup(@() rmdir(tmpdir, 's'));
+    gunzipped = gunzip(edf_fname, tmpdir);
+    edf_fname = gunzipped{1};
+end
 
 fid = fopen(edf_fname, 'r', 'ieee-le');
 if fid < 0

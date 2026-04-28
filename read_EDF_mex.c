@@ -1,160 +1,29 @@
 /**
  * READ_EDF_MEX  High-performance EDF / EDF+ file reader for MATLAB
  *
- * -------------------------------------------------------------------------
- * DESCRIPTION
- * -------------------------------------------------------------------------
- *   READ_EDF_MEX is a compiled MEX implementation of a fast and robust
- *   European Data Format (EDF / EDF+) reader. It performs:
+ * Supports plain .edf and gzip-compressed .edf.gz inputs. Compressed files
+ * are decoded on the fly via zlib — no temp file is created. Reads stream
+ * record-by-record, so peak memory is one record's worth of raw bytes plus
+ * the per-signal output arrays.
  *
- *       • Full main header parsing (256-byte EDF header)
- *       • Per-signal header parsing
- *       • Automatic correction of invalid num_data_records
- *       • Digital → physical unit conversion
- *       • Multi-channel extraction with optional subset selection
- *       • A-B rereferencing (e.g. 'EEG C3-A2')
- *       • EDF+ annotation (TAL) parsing
- *       • Optional on-disk header repair
- *       • Extensive debug instrumentation (when enabled)
- *
- *   The reader is designed for:
- *
- *       • Large PSG / EEG datasets
- *       • Clinical EDF+ files with malformed record counts
- *       • Efficient memory usage
- *       • Deterministic, release-build stability
- *
- * -------------------------------------------------------------------------
- * MATLAB USAGE
- * -------------------------------------------------------------------------
- *
+ * MATLAB usage:
  *   [header, sigheader, data, annotations] =
  *       read_EDF_mex(filename, channels, epochs, verbose, repair, debug)
  *
- *   Required:
- *       filename  : string
- *
- *   Optional:
- *       channels  : cell array of channel name strings
- *                   Use 'ChA-ChB' for a rereferenced channel.
- *                   Empty cell {} or omitted → load all channels.
- *       epochs    : (currently unused placeholder)
- *       verbose   : logical (prints header repair info)
- *       repair    : logical (rewrite corrected record count to disk)
- *       debug     : logical (enables internal assertions + tracing)
- *
- * -------------------------------------------------------------------------
- * OUTPUTS
- * -------------------------------------------------------------------------
- *
- *   header      : 1x1 struct
- *       edf_ver
- *       patient_id
- *       local_rec_id
- *       recording_startdate
- *       recording_starttime
- *       num_header_bytes
- *       num_data_records
- *       data_record_duration
- *       num_signals
- *
- *   sigheader   : 1xN struct array (per output signal/channel)
- *       signal_labels
- *       transducer_type
- *       physical_dimension
- *       physical_min
- *       physical_max
- *       digital_min
- *       digital_max
- *       prefiltering
- *       samples_in_record
- *       sampling_frequency
- *
- *   data        : 1xN cell array
- *       Each cell contains a 1x(total_samples) double vector
- *       converted to physical units.
- *       For rereferenced channels the cell contains sigA - sigB.
- *
- *   annotations : struct array (EDF+ only)
- *       onset   : double (seconds)
- *       text    : 1xM cell array of annotation strings
- *
- * -------------------------------------------------------------------------
- * CHANNEL SELECTION AND REREFERENCING
- * -------------------------------------------------------------------------
- *
- *   When the channels cell array is non-empty:
- *
- *     • Plain channels  : must match a signal_label exactly
- *                         (case-insensitive, whitespace-trimmed)
- *     • Reref channels  : 'ChA-ChB' — tries each '-' as a split point,
- *                         leftmost first. Both sides must be valid labels.
- *                         Output = physical(ChA) - physical(ChB).
- *                         The output channel inherits ChA's header and
- *                         carries the label 'ChA-ChB'.
- *
- *   Only channels in the channels list appear in sigheader / data.
- *   Constituent-only signals (needed for subtraction but not requested
- *   directly) are loaded internally but excluded from the output.
- *
- * -------------------------------------------------------------------------
- * DIGITAL → PHYSICAL CONVERSION
- * -------------------------------------------------------------------------
- *
- *   For each signal:
- *
- *       scale = (phys_max - phys_min) / (dig_max - dig_min)
- *       offset = phys_min - dig_min * scale
- *
- *       physical_value = digital_value * scale + offset
- *
- * -------------------------------------------------------------------------
- * EDF+ RECORD COUNT CORRECTION
- * -------------------------------------------------------------------------
- *
- *   Many EDF+ files contain:
- *       num_data_records = -1
- *       or incorrect values.
- *
- *   This implementation derives the true record count from:
- *
- *       file_size
- *       header.num_header_bytes
- *       samples_in_record (all channels)
- *
- *   If mismatch is detected:
- *       • header is corrected in memory
- *       • optionally repaired on disk (repair = true)
- *
- * -------------------------------------------------------------------------
- * DEBUG MODE
- * -------------------------------------------------------------------------
- *
- *   When debug = true:
- *       • Internal assertions are enabled
- *       • Detailed header + signal diagnostics printed
- *       • Raw sample previews printed (first channel only)
- *
- *   Intended for development, not production.
- *
- * -------------------------------------------------------------------------
- * COMPILATION
- * -------------------------------------------------------------------------
- *
- *   mex -O -largeArrayDims read_EDF_mex.c
+ * Compilation:
+ *   mex -O -largeArrayDims read_EDF_mex.c -lz
  *
  *   -largeArrayDims is REQUIRED.
+ *   -lz links against system zlib (present on macOS via the Xcode SDK and
+ *   on most Linux distributions).
  *
- * -------------------------------------------------------------------------
- * NOTES
- * -------------------------------------------------------------------------
- *
- *   • Assumes little-endian EDF (standard compliant).
- *   • Digital samples are 16-bit signed integers.
- *   • Designed for large datasets (uses mwSize indexing).
- *   • Safe for multi-GB EDF files.
- *
- * -------------------------------------------------------------------------
+ * Notes on .gz:
+ *   • RepairHeader is silently skipped for .gz inputs — we cannot rewrite
+ *     a single byte of a gzip archive in place. The header is still
+ *     corrected in the returned struct.
+ *   • num_data_records reported in the EDF main header is trusted for
+ *     header-only calls (nargout == 1). When data is requested, the actual
+ *     record count is determined by streaming and the header is updated.
  */
 
 #include "mex.h"
@@ -163,6 +32,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <zlib.h>
 
 #if defined(MX_COMPAT_32)
 #error "This MEX requires -largeArrayDims"
@@ -179,6 +49,75 @@ static int g_debug = 0;
 #define DBG(...) do { if (g_debug) mexPrintf(__VA_ARGS__); } while (0)
 #define ASSERT(cond) \
     do { if (g_debug && !(cond)) mexErrMsgIdAndTxt("read_EDF_mex:Assert", #cond); } while (0)
+
+/* ============================================================
+ *                         IO ABSTRACTION
+ * ============================================================
+ *
+ * Wraps either a plain FILE* or a zlib gzFile so the rest of the
+ * code reads identically. Detect .gz by file extension on open.
+ */
+
+typedef struct {
+    int     is_gz;
+    FILE   *fp;
+    gzFile  gz;
+} EDFReader;
+
+static int has_gz_suffix(const char *fname)
+{
+    size_t n = strlen(fname);
+    if (n < 3) return 0;
+    return (tolower((unsigned char)fname[n-3]) == '.' &&
+            tolower((unsigned char)fname[n-2]) == 'g' &&
+            tolower((unsigned char)fname[n-1]) == 'z');
+}
+
+static int edfr_open(EDFReader *r, const char *fname)
+{
+    r->fp = NULL;
+    r->gz = NULL;
+    r->is_gz = has_gz_suffix(fname);
+
+    if (r->is_gz) {
+        r->gz = gzopen(fname, "rb");
+        return (r->gz != NULL);
+    } else {
+        r->fp = fopen(fname, "rb");
+        return (r->fp != NULL);
+    }
+}
+
+static void edfr_close(EDFReader *r)
+{
+    if (r->is_gz) {
+        if (r->gz) { gzclose(r->gz); r->gz = NULL; }
+    } else {
+        if (r->fp) { fclose(r->fp); r->fp = NULL; }
+    }
+}
+
+/* Returns number of bytes actually read (0 on EOF or error). */
+static size_t edfr_read(EDFReader *r, void *buf, size_t n)
+{
+    if (r->is_gz) {
+        int got = gzread(r->gz, buf, (unsigned)n);
+        if (got <= 0) return 0;
+        return (size_t)got;
+    } else {
+        return fread(buf, 1, n, r->fp);
+    }
+}
+
+/* Absolute seek from start of (uncompressed) stream. */
+static int edfr_seek_set(EDFReader *r, mwSize off)
+{
+    if (r->is_gz) {
+        return (gzseek(r->gz, (z_off_t)off, SEEK_SET) >= 0);
+    } else {
+        return (fseek(r->fp, (long)off, SEEK_SET) == 0);
+    }
+}
 
 /* ============================================================
  *                         STRUCTS
@@ -216,14 +155,13 @@ typedef struct {
  *                  CHANNEL PLAN STRUCTS
  * ============================================================ */
 
-/* Describes one entry in the user's channel request list. */
 typedef enum { CH_PLAIN, CH_REREF } ChannelKind;
 
 typedef struct {
     ChannelKind kind;
-    char label[64];          /* output label (plain name or "ChA-ChB")  */
-    int  raw_idx_a;          /* index into sig[] for ChA (or plain ch)  */
-    int  raw_idx_b;          /* index into sig[] for ChB (-1 if plain)  */
+    char label[64];
+    int  raw_idx_a;
+    int  raw_idx_b;
 } ChannelPlan;
 
 /* ============================================================
@@ -239,7 +177,6 @@ static void trim_string(char *s)
     while (n && s[n-1] == ' ') s[--n] = '\0';
 }
 
-/* Case-insensitive strcmp */
 static int ci_strcmp(const char *a, const char *b)
 {
     while (*a && *b) {
@@ -249,8 +186,6 @@ static int ci_strcmp(const char *a, const char *b)
     return (*a != *b);
 }
 
-/* Find signal index by label (case-insensitive, trimmed).
- * Returns -1 if not found. */
 static int find_signal(const Signal_Header *sig, int nsig, const char *name)
 {
     for (int i = 0; i < nsig; i++) {
@@ -264,12 +199,12 @@ static int find_signal(const Signal_Header *sig, int nsig, const char *name)
  *                         HEADER IO
  * ============================================================ */
 
-static int read_edf_header(FILE *fid, EDF_Header *h)
+static int read_edf_header(EDFReader *rd, EDF_Header *h)
 {
     unsigned char buf[EDF_HEADER_SIZE];
     char tmp[16];
 
-    if (fread(buf, 1, EDF_HEADER_SIZE, fid) != EDF_HEADER_SIZE) return 0;
+    if (edfr_read(rd, buf, EDF_HEADER_SIZE) != EDF_HEADER_SIZE) return 0;
 
     memcpy(h->edf_ver,             buf,     8); h->edf_ver[8]             = '\0'; trim_string(h->edf_ver);
     memcpy(h->patient_id,          buf+8,  80); h->patient_id[80]         = '\0'; trim_string(h->patient_id);
@@ -285,34 +220,41 @@ static int read_edf_header(FILE *fid, EDF_Header *h)
     return 1;
 }
 
-static int read_signal_headers(FILE *fid, Signal_Header *sh, int nsig)
+static int read_signal_headers(EDFReader *rd, Signal_Header *sh, int nsig)
 {
     char tmp[16];
     int i;
 
-    for (i=0;i<nsig;i++) { fread(sh[i].signal_labels,   16,1,fid); sh[i].signal_labels[16]  ='\0'; trim_string(sh[i].signal_labels);   }
-    for (i=0;i<nsig;i++) { fread(sh[i].transducer_type,  80,1,fid); sh[i].transducer_type[80] ='\0'; trim_string(sh[i].transducer_type); }
-    for (i=0;i<nsig;i++) { fread(sh[i].physical_dimension,8,1,fid); sh[i].physical_dimension[8]='\0'; }
-    for (i=0;i<nsig;i++) { fread(tmp,8,1,fid); tmp[8]='\0'; sh[i].physical_min=atof(tmp); }
-    for (i=0;i<nsig;i++) { fread(tmp,8,1,fid); tmp[8]='\0'; sh[i].physical_max=atof(tmp); }
-    for (i=0;i<nsig;i++) { fread(tmp,8,1,fid); tmp[8]='\0'; sh[i].digital_min =atof(tmp); }
-    for (i=0;i<nsig;i++) { fread(tmp,8,1,fid); tmp[8]='\0'; sh[i].digital_max =atof(tmp); }
-    for (i=0;i<nsig;i++) { fread(sh[i].prefiltering, 80,1,fid); sh[i].prefiltering[80]='\0'; }
-    for (i=0;i<nsig;i++) { fread(tmp,8,1,fid); tmp[8]='\0'; sh[i].samples_in_record=atoi(tmp); }
-    for (i=0;i<nsig;i++) { fread(tmp,32,1,fid); } /* reserved */
+    for (i=0;i<nsig;i++) { edfr_read(rd, sh[i].signal_labels,   16); sh[i].signal_labels[16]  ='\0'; trim_string(sh[i].signal_labels);   }
+    for (i=0;i<nsig;i++) { edfr_read(rd, sh[i].transducer_type,  80); sh[i].transducer_type[80] ='\0'; trim_string(sh[i].transducer_type); }
+    for (i=0;i<nsig;i++) { edfr_read(rd, sh[i].physical_dimension,8); sh[i].physical_dimension[8]='\0'; }
+    for (i=0;i<nsig;i++) { edfr_read(rd, tmp,8); tmp[8]='\0'; sh[i].physical_min=atof(tmp); }
+    for (i=0;i<nsig;i++) { edfr_read(rd, tmp,8); tmp[8]='\0'; sh[i].physical_max=atof(tmp); }
+    for (i=0;i<nsig;i++) { edfr_read(rd, tmp,8); tmp[8]='\0'; sh[i].digital_min =atof(tmp); }
+    for (i=0;i<nsig;i++) { edfr_read(rd, tmp,8); tmp[8]='\0'; sh[i].digital_max =atof(tmp); }
+    for (i=0;i<nsig;i++) { edfr_read(rd, sh[i].prefiltering, 80); sh[i].prefiltering[80]='\0'; }
+    for (i=0;i<nsig;i++) { edfr_read(rd, tmp,8); tmp[8]='\0'; sh[i].samples_in_record=atoi(tmp); }
+    for (i=0;i<nsig;i++) { edfr_read(rd, tmp,32); } /* reserved */
 
     return 1;
 }
 
 /* ============================================================
- *                 EDF+ num_data_records FIX
- * ============================================================ */
-
-static void fix_num_records(FILE *fid, EDF_Header *hdr,
-                            Signal_Header *sig,
-                            const char *fname,
-                            int verbose,
-                            int repair)
+ *                 EDF+ num_data_records FIX (plain only)
+ * ============================================================
+ *
+ * Plain files: derive record count from file size and optionally rewrite
+ * byte 236 of the header. Leaves stream positioned at hdr.num_header_bytes.
+ *
+ * Gz files: skipped entirely. The streaming data loop discovers the true
+ * record count and updates hdr.num_data_records after the read. RepairHeader
+ * cannot be honored on a .gz — we warn if verbose.
+ */
+static void fix_num_records_plain(EDFReader *rd, EDF_Header *hdr,
+                                  Signal_Header *sig,
+                                  const char *fname,
+                                  int verbose,
+                                  int repair)
 {
     mwSize total_samp_per_rec = 0;
     for (int i = 0; i < hdr->num_signals; i++)
@@ -327,12 +269,11 @@ static void fix_num_records(FILE *fid, EDF_Header *hdr,
     ASSERT(total_samp_per_rec > 0);
 
     mwSize bytes_per_rec = total_samp_per_rec * 2;
-
-    fseek(fid, 0, SEEK_END);
-    mwSize fsize = (mwSize)ftell(fid);
-    mwSize data_bytes = fsize - hdr->num_header_bytes;
-
     if (bytes_per_rec == 0) return;
+
+    fseek(rd->fp, 0, SEEK_END);
+    mwSize fsize = (mwSize)ftell(rd->fp);
+    mwSize data_bytes = fsize - hdr->num_header_bytes;
 
     mwSize actual_records = data_bytes / bytes_per_rec;
 
@@ -358,7 +299,7 @@ static void fix_num_records(FILE *fid, EDF_Header *hdr,
         hdr->num_data_records = (int)actual_records;
     }
 
-    fseek(fid, hdr->num_header_bytes, SEEK_SET);
+    fseek(rd->fp, hdr->num_header_bytes, SEEK_SET);
 }
 
 /* ============================================================
@@ -429,21 +370,10 @@ static void parse_tal_block_fast(
  *                   CHANNEL PLAN BUILDER
  * ============================================================ */
 
-/*  Parse the user-supplied channels cell array and build a ChannelPlan[].
- *
- *  Rules (mirror the MATLAB parse_channel_plan / apply_channel_plan logic):
- *    1. If a requested name matches a file label exactly (ci)  →  plain.
- *    2. Otherwise try each '-' as a split; if both sides are valid labels
- *       take the leftmost valid split  →  reref.
- *    3. Unknown names are kept as plain (will later fail at find_signal).
- *
- *  Returns the number of plan entries, and also fills need_raw[0..nsig-1]
- *  to indicate which raw signals must actually be decoded.
- */
 static int build_channel_plan(const mxArray *ch_cell,
                               const Signal_Header *sig, int nsig,
-                              ChannelPlan *plan,          /* out, preallocated */
-                              int *need_raw)              /* out, preallocated, zero-initialised */
+                              ChannelPlan *plan,
+                              int *need_raw)
 {
     mwSize nchan = mxGetNumberOfElements(ch_cell);
     int nplan = 0;
@@ -454,7 +384,6 @@ static int build_channel_plan(const mxArray *ch_cell,
 
         char req[64];
         mxGetString(elem, req, sizeof(req));
-        /* trim */
         {
             char *p = req;
             while (*p == ' ') p++;
@@ -464,7 +393,6 @@ static int build_channel_plan(const mxArray *ch_cell,
         }
         if (req[0] == '\0') continue;
 
-        /* --- 1. Direct label match? --- */
         int idx = find_signal(sig, nsig, req);
         if (idx >= 0) {
             plan[nplan].kind       = CH_PLAIN;
@@ -477,7 +405,6 @@ static int build_channel_plan(const mxArray *ch_cell,
             continue;
         }
 
-        /* --- 2. Try each '-' as A-B split, leftmost first --- */
         int found_reref = 0;
         size_t req_len = strlen(req);
         for (size_t d = 1; d < req_len; d++) {
@@ -491,7 +418,6 @@ static int build_channel_plan(const mxArray *ch_cell,
             strncpy(chA, req,     la); chA[la] = '\0';
             strncpy(chB, req+d+1, lb); chB[lb] = '\0';
 
-            /* trim chA / chB */
             {
                 char *p = chA; while(*p==' ')p++; memmove(chA,p,strlen(p)+1);
                 size_t n=strlen(chA); while(n&&chA[n-1]==' ')chA[--n]='\0';
@@ -517,7 +443,6 @@ static int build_channel_plan(const mxArray *ch_cell,
         }
 
         if (!found_reref) {
-            /* Unknown channel – pass through as plain; will error later if absent */
             plan[nplan].kind      = CH_PLAIN;
             plan[nplan].raw_idx_a = -1;
             plan[nplan].raw_idx_b = -1;
@@ -545,21 +470,28 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     char fname[4096];
     mxGetString(prhs[0], fname, sizeof(fname));
 
-    /* --- Has the caller supplied a non-empty channels cell? --- */
     int use_channel_plan = 0;
     if (nrhs > 1 && mxIsCell(prhs[1]) && mxGetNumberOfElements(prhs[1]) > 0)
         use_channel_plan = 1;
 
-    FILE *fid = fopen(fname, "rb");
-    if (!fid) mexErrMsgIdAndTxt("read_EDF_mex:File", "Cannot open file");
+    EDFReader rd;
+    if (!edfr_open(&rd, fname))
+        mexErrMsgIdAndTxt("read_EDF_mex:File", "Cannot open file");
+
+    DBG("\n===== INPUT =====\n");
+    DBG("File: %s\n", fname);
+    DBG("Compressed: %s\n", rd.is_gz ? "yes (.gz)" : "no");
+    DBG("=================\n\n");
 
     /* ============================================================
      *                       READ MAIN HEADER
      * ============================================================ */
 
     EDF_Header hdr;
-    if (!read_edf_header(fid, &hdr))
+    if (!read_edf_header(&rd, &hdr)) {
+        edfr_close(&rd);
         mexErrMsgIdAndTxt("read_EDF_mex:Header", "Invalid EDF header");
+    }
 
     DBG("\n===== EDF MAIN HEADER =====\n");
     DBG("Header bytes: %d\n",           hdr.num_header_bytes);
@@ -577,7 +509,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
      * ============================================================ */
 
     Signal_Header *sig = mxCalloc(hdr.num_signals, sizeof(Signal_Header));
-    read_signal_headers(fid, sig, hdr.num_signals);
+    read_signal_headers(&rd, sig, hdr.num_signals);
 
     mwSize total_samp_per_rec = 0;
     int annot_idx = -1;
@@ -601,11 +533,18 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     ASSERT(total_samp_per_rec > 0);
 
     /* ============================================================
-     *                 FIX EDF+ num_data_records
+     *           FIX EDF+ num_data_records (plain files only)
      * ============================================================ */
 
     int repair = (nrhs > 4 && mxGetScalar(prhs[4]) != 0);
-    fix_num_records(fid, &hdr, sig, fname, verbose, repair);
+
+    if (rd.is_gz) {
+        if (repair && verbose)
+            mexPrintf("RepairHeader requested but file is gzipped — "
+                      "skipping on-disk repair.\n");
+    } else {
+        fix_num_records_plain(&rd, &hdr, sig, fname, verbose, repair);
+    }
 
     mwSize bytes_per_rec = total_samp_per_rec * 2;
 
@@ -613,7 +552,6 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
      *                   BUILD CHANNEL PLAN
      * ============================================================ */
 
-    /* need_raw[i] == 1  →  signal i must be decoded from disk */
     int *need_raw = mxCalloc(hdr.num_signals, sizeof(int));
 
     ChannelPlan *plan = NULL;
@@ -623,9 +561,11 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         plan = mxMalloc(mxGetNumberOfElements(prhs[1]) * sizeof(ChannelPlan));
         nplan = build_channel_plan(prhs[1], sig, hdr.num_signals, plan, need_raw);
 
-        if (nplan == 0)
+        if (nplan == 0) {
+            edfr_close(&rd);
             mexErrMsgIdAndTxt("read_EDF_mex:NoChannels",
                               "No valid channels found in the channel list.");
+        }
 
         DBG("\n===== CHANNEL PLAN =====\n");
         for (int p = 0; p < nplan; p++) {
@@ -637,99 +577,155 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         }
         DBG("========================\n\n");
     } else {
-        /* All signals */
         for (int i = 0; i < hdr.num_signals; i++)
             need_raw[i] = 1;
     }
 
     /* ============================================================
-     *                 READ RAW DATA (if requested)
-     * ============================================================ */
-
-    /*
-     * raw_signals[i] – decoded physical-unit array for signal i,
-     *                  only allocated when need_raw[i] == 1.
+     *               STREAMING DATA + ANNOTATION READ
+     * ============================================================
+     *
+     * Read records one at a time. For each record:
+     *   • decode samples for any signal in need_raw[]
+     *   • parse annotations (if requested and present)
+     *
+     * Output arrays are pre-sized from hdr.num_data_records (or 64 if the
+     * header's count is missing/invalid) and grown by doubling. After the
+     * loop, hdr.num_data_records is set to the actual count.
      */
+
+    int want_data   = (nlhs >= 3);
+    int want_annots = (nlhs >= 4) && (annot_idx >= 0);
+
     double **raw_signals = NULL;
-    mwSize  *sig_lengths  = NULL;
+    mwSize  *sig_lengths = NULL;          /* total samples per signal (= spr * records_read) */
+    mwSize  *sig_offset  = NULL;
+    Annotation *alist = NULL;
+    mwSize acount = 0;
+    mwSize records_read = 0;
 
-    if (nlhs >= 3) {
-        raw_signals = mxCalloc(hdr.num_signals, sizeof(double *));
-        sig_lengths  = mxCalloc(hdr.num_signals, sizeof(mwSize));
+    if (want_data || want_annots) {
 
-        /* Read the entire data section once into a byte buffer */
-        fseek(fid, 0, SEEK_END);
-        mwSize fsize      = (mwSize)ftell(fid);
-        mwSize data_bytes = fsize - hdr.num_header_bytes;
-
-        DBG("\n===== FILE SIZE CHECK =====\n");
-        DBG("File size: %llu\n",     (unsigned long long)fsize);
-        DBG("Header bytes: %d\n",    hdr.num_header_bytes);
-        DBG("Data bytes: %llu\n",    (unsigned long long)data_bytes);
-        DBG("Bytes per record: %llu\n", (unsigned long long)bytes_per_rec);
-        DBG("===========================\n\n");
-
-        ASSERT(bytes_per_rec > 0);
-        ASSERT(data_bytes    > 0);
-
-        unsigned char *raw = mxMalloc(data_bytes);
-        fseek(fid, hdr.num_header_bytes, SEEK_SET);
-        size_t nread = fread(raw, 1, data_bytes, fid);
-
-        DBG("fread requested: %llu\n", (unsigned long long)data_bytes);
-        DBG("fread returned:  %llu\n", (unsigned long long)nread);
-        ASSERT(nread == data_bytes);
-
-        /* Per-signal offset (in samples) within each record */
-        mwSize *sig_offset = mxMalloc(hdr.num_signals * sizeof(mwSize));
-        mwSize acc = 0;
-        for (int s = 0; s < hdr.num_signals; s++) {
-            sig_offset[s] = acc;
-            acc += sig[s].samples_in_record;
+        /* Per-signal byte/sample offsets within a record. */
+        sig_offset = mxMalloc(hdr.num_signals * sizeof(mwSize));
+        {
+            mwSize acc = 0;
+            for (int s = 0; s < hdr.num_signals; s++) {
+                sig_offset[s] = acc;
+                acc += sig[s].samples_in_record;
+            }
         }
 
-        DBG("\n===== DECODING SIGNALS =====\n");
+        /* Initial output capacity in records. */
+        mwSize records_capacity =
+            (hdr.num_data_records > 0) ? (mwSize)hdr.num_data_records : 64;
 
-        for (int s = 0; s < hdr.num_signals; s++) {
-            if (!need_raw[s]) continue;
+        if (want_data) {
+            raw_signals = mxCalloc(hdr.num_signals, sizeof(double *));
+            sig_lengths = mxCalloc(hdr.num_signals, sizeof(mwSize));
 
-            mwSize spr = (mwSize)sig[s].samples_in_record;
-            mwSize len = spr * (mwSize)hdr.num_data_records;
+            for (int s = 0; s < hdr.num_signals; s++) {
+                if (!need_raw[s]) continue;
+                ASSERT(sig[s].digital_max != sig[s].digital_min);
+                mwSize len = (mwSize)sig[s].samples_in_record * records_capacity;
+                raw_signals[s] = mxMalloc(len * sizeof(double));
+            }
+        }
 
-            DBG("Decoding signal %d (%s), len=%llu\n",
-                s, sig[s].signal_labels, (unsigned long long)len);
+        /* One record's worth of raw bytes. */
+        unsigned char *rec_buf = mxMalloc(bytes_per_rec);
 
-            ASSERT(len > 0);
-            ASSERT(sig[s].digital_max != sig[s].digital_min);
+        DBG("\n===== STREAMING DATA =====\n");
+        DBG("Initial records_capacity: %llu\n",
+            (unsigned long long)records_capacity);
 
-            double *out = mxMalloc(len * sizeof(double));
+        for (;;) {
+            size_t got = edfr_read(&rd, rec_buf, bytes_per_rec);
+            if (got == 0) break;
+            if (got < bytes_per_rec) {
+                /* Trailing partial record — discard, matches plain-file
+                 * behavior which truncates by integer division of file size. */
+                break;
+            }
 
-            double scale = (sig[s].physical_max - sig[s].physical_min) /
-                           (sig[s].digital_max  - sig[s].digital_min);
-            double offs  =  sig[s].physical_min - sig[s].digital_min * scale;
+            /* Grow output arrays if we exceeded the planned capacity. */
+            if (want_data && records_read >= records_capacity) {
+                mwSize new_cap = records_capacity * 2;
+                for (int s = 0; s < hdr.num_signals; s++) {
+                    if (!need_raw[s]) continue;
+                    mwSize new_len = (mwSize)sig[s].samples_in_record * new_cap;
+                    raw_signals[s] = mxRealloc(raw_signals[s],
+                                               new_len * sizeof(double));
+                }
+                records_capacity = new_cap;
+            }
 
-            mwSize out_i = 0;
-            for (mwSize r = 0; r < (mwSize)hdr.num_data_records; r++) {
-                mwSize base = r * total_samp_per_rec + sig_offset[s];
-                for (mwSize k = 0; k < spr; k++) {
-                    mwSize bidx = 2 * (base + k);
-                    int16_t vraw = (int16_t)(raw[bidx] | (raw[bidx+1] << 8));
+            /* Decode each requested signal in this record. */
+            if (want_data) {
+                for (int s = 0; s < hdr.num_signals; s++) {
+                    if (!need_raw[s]) continue;
+                    mwSize spr = (mwSize)sig[s].samples_in_record;
+                    mwSize byte_off = sig_offset[s] * 2;
 
-                    if (g_debug && s == 0 && r == 0 && k < 5)
-                        DBG("Raw[%llu]=%d\n", (unsigned long long)k, vraw);
+                    double scale = (sig[s].physical_max - sig[s].physical_min) /
+                                   (sig[s].digital_max  - sig[s].digital_min);
+                    double offs  =  sig[s].physical_min - sig[s].digital_min * scale;
 
-                    out[out_i++] = vraw * scale + offs;
+                    double *dst = raw_signals[s] + records_read * spr;
+                    const unsigned char *src = rec_buf + byte_off;
+
+                    for (mwSize k = 0; k < spr; k++) {
+                        int16_t vraw = (int16_t)(src[2*k] | (src[2*k+1] << 8));
+                        dst[k] = vraw * scale + offs;
+                    }
+
+                    if (g_debug && s == 0 && records_read == 0) {
+                        for (mwSize k = 0; k < 5 && k < spr; k++) {
+                            int16_t vraw = (int16_t)(src[2*k] | (src[2*k+1] << 8));
+                            DBG("Raw[%llu]=%d\n", (unsigned long long)k, vraw);
+                        }
+                    }
                 }
             }
 
-            raw_signals[s] = out;
-            sig_lengths[s]  = len;
+            /* Parse this record's annotation slice in place. */
+            if (want_annots) {
+                mwSize annot_byte_off = sig_offset[annot_idx] * 2;
+                mwSize annot_bytes = (mwSize)sig[annot_idx].samples_in_record * 2;
+                parse_tal_block_fast(rec_buf + annot_byte_off, annot_bytes,
+                                     &alist, &acount);
+            }
+
+            records_read++;
         }
 
-        DBG("============================\n\n");
+        DBG("Records read: %llu\n", (unsigned long long)records_read);
+        DBG("===========================\n\n");
 
-        mxFree(sig_offset);
-        mxFree(raw);
+        mxFree(rec_buf);
+
+        /* Reconcile the header with the actual record count. */
+        if ((mwSize)hdr.num_data_records != records_read) {
+            if (verbose)
+                mexPrintf("num_data_records: header=%d, actual=%llu\n",
+                          hdr.num_data_records,
+                          (unsigned long long)records_read);
+            hdr.num_data_records = (int)records_read;
+        }
+
+        /* Trim per-signal output arrays to actual length. */
+        if (want_data) {
+            for (int s = 0; s < hdr.num_signals; s++) {
+                if (!need_raw[s]) continue;
+                mwSize spr = (mwSize)sig[s].samples_in_record;
+                mwSize len = spr * records_read;
+                if (records_read != records_capacity) {
+                    raw_signals[s] = mxRealloc(raw_signals[s],
+                                               (len ? len : 1) * sizeof(double));
+                }
+                sig_lengths[s] = len;
+            }
+        }
     }
 
     /* ============================================================
@@ -759,20 +755,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
      *         SIGNAL HEADER + DATA OUTPUT (channel-plan aware)
      * ============================================================ */
 
-    /*
-     * Determine the output channel list:
-     *   • If a channel plan was built  →  iterate plan[] in order.
-     *   • Otherwise                    →  emit all signals in file order.
-     */
-    int out_count;          /* number of output channels */
+    int out_count = use_channel_plan ? nplan : hdr.num_signals;
 
-    if (use_channel_plan) {
-        out_count = nplan;
-    } else {
-        out_count = hdr.num_signals;
-    }
-
-    /* ---- Signal header output ---- */
     if (nlhs >= 2) {
         const char *f[] = {"signal_labels","transducer_type",
                            "physical_dimension","physical_min",
@@ -783,11 +767,10 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         plhs[1] = mxCreateStructMatrix(1, out_count, 10, f);
 
         for (int o = 0; o < out_count; o++) {
-            int s;          /* raw signal index for this output slot */
+            int s;
             const char *lbl;
 
             if (use_channel_plan) {
-                /* For reref we inherit ChA's header */
                 s   = (plan[o].raw_idx_a >= 0) ? plan[o].raw_idx_a : 0;
                 lbl = plan[o].label;
             } else {
@@ -818,9 +801,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
         }
     }
 
-    /* ---- Signal data output ---- */
     if (nlhs >= 3 && raw_signals != NULL) {
-        ASSERT(hdr.num_data_records > 0);
+        ASSERT(hdr.num_data_records >= 0);
 
         plhs[2] = mxCreateCellMatrix(1, out_count);
 
@@ -830,7 +812,6 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
                 int ib = plan[o].raw_idx_b;
 
                 if (ia < 0) {
-                    /* Unknown channel requested – emit empty */
                     mxSetCell(plhs[2], o, mxCreateDoubleMatrix(1, 0, mxREAL));
                     mexWarnMsgIdAndTxt("read_EDF_mex:UnknownChannel",
                         "Channel '%s' not found in file.", plan[o].label);
@@ -843,10 +824,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
                 double  *d = mxGetPr(v);
 
                 if (plan[o].kind == CH_PLAIN) {
-                    /* Direct copy */
                     memcpy(d, raw_signals[ia], len * sizeof(double));
                 } else {
-                    /* Rereferenced: ChA - ChB  (lengths must match) */
                     mwSize len_b = sig_lengths[ib];
                     if (len != len_b) {
                         mxDestroyArray(v);
@@ -866,61 +845,42 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
                 mxSetCell(plhs[2], o, v);
 
             } else {
-                /* No channel plan – emit all decoded signals in file order */
                 mwSize len = sig_lengths[o];
                 mxArray *v = mxCreateDoubleMatrix(1, len, mxREAL);
-                memcpy(mxGetPr(v), raw_signals[o], len * sizeof(double));
+                if (len > 0)
+                    memcpy(mxGetPr(v), raw_signals[o], len * sizeof(double));
                 mxSetCell(plhs[2], o, v);
             }
         }
     }
 
-    /* Free per-signal decode buffers */
     if (raw_signals) {
         for (int s = 0; s < hdr.num_signals; s++)
             if (raw_signals[s]) mxFree(raw_signals[s]);
         mxFree(raw_signals);
     }
     if (sig_lengths) mxFree(sig_lengths);
+    if (sig_offset)  mxFree(sig_offset);
 
     /* ============================================================
      *                     ANNOTATION OUTPUT
      * ============================================================ */
 
-    if (nlhs >= 4 && annot_idx >= 0) {
+    if (nlhs >= 4) {
         const char *f[] = {"onset", "text"};
-        mxArray *A = mxCreateStructMatrix(0, 0, 2, f);
-
-        Annotation *alist = NULL;
-        mwSize acount = 0;
-
-        for (mwSize r = 0; r < (mwSize)hdr.num_data_records; r++) {
-            mwSize byte_off = 0;
-            for (int i = 0; i < annot_idx; i++)
-                byte_off += sig[i].samples_in_record * 2;
-
-            mwSize annot_bytes = sig[annot_idx].samples_in_record * 2;
-            unsigned char *blk = mxMalloc(annot_bytes);
-
-            fseek(fid,
-                  hdr.num_header_bytes + r * bytes_per_rec + byte_off,
-                  SEEK_SET);
-            fread(blk, 1, annot_bytes, fid);
-
-            parse_tal_block_fast(blk, annot_bytes, &alist, &acount);
-            mxFree(blk);
-        }
+        mxArray *A;
 
         if (acount > 0) {
-            mxDestroyArray(A);
             A = mxCreateStructMatrix(acount, 1, 2, f);
             for (mwSize i = 0; i < acount; i++) {
                 mxSetField(A, i, "onset", mxCreateDoubleScalar(alist[i].onset));
                 mxSetField(A, i, "text",  alist[i].texts);
             }
+        } else {
+            A = mxCreateStructMatrix(0, 0, 2, f);
         }
 
-        mxFree(alist);
+        if (alist) mxFree(alist);
         plhs[3] = A;
     }
 
@@ -928,5 +888,5 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     if (plan)     mxFree(plan);
     if (need_raw) mxFree(need_raw);
     mxFree(sig);
-    fclose(fid);
+    edfr_close(&rd);
 }
