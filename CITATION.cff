@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "read_EDF"
-abstract: "High-performance EDF/EDF+ reader for MATLAB with MEX acceleration."
+title: "EDF_toolbox"
+abstract: "High-performance EDF/EDF+ reader and writer for MATLAB with MEX acceleration, on-the-fly gzip support, and an anti-aliased resample/batch pipeline."
 authors:
   - family-names: Prerau
     given-names: Michael J.
@@ -10,5 +10,5 @@ authors:
     orcid: "https://orcid.org/0000-0002-9010-5273"
 type: software
 license: BSD-3-Clause
-url: "https://github.com/preraulab/read_EDF"
-repository-code: "https://github.com/preraulab/read_EDF"
+url: "https://github.com/preraulab/EDF_toolbox"
+repository-code: "https://github.com/preraulab/EDF_toolbox"

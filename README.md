@@ -1,4 +1,4 @@
-# read_EDF
+# EDF_toolbox
 
 High-performance EDF / EDF+ reader **and writer** for MATLAB, with compiled MEX backends and pure-MATLAB fallbacks. Reads and writes plain `.edf` and gzip-compressed `.edf.gz` (on the fly, no temp file). Bundled with `convert_EDF` (read → resample → write) and `batch_convert_EDF` (parallel multi-file pipeline), plus a `bin/convert_edf` shell CLI.
 
@@ -218,7 +218,7 @@ The CLI shells out to MATLAB once per invocation — startup cost (~10 s) is amo
 If a pre-built MEX isn't available for your platform (Linux, Windows), `read_EDF.m` and `write_EDF.m` will auto-compile on first call. The build pulls in the vendored zlib, so it works the same on macOS, Linux, and Windows with no system dependencies. To rebuild manually:
 
 ```matlab
-% From the read_EDF directory
+% From the EDF_toolbox directory
 mex -O -largeArrayDims -Izlib read_EDF_mex.c  zlib/*.c
 mex -O -largeArrayDims -Izlib write_EDF_mex.c zlib/*.c
 ```
@@ -226,7 +226,7 @@ mex -O -largeArrayDims -Izlib write_EDF_mex.c zlib/*.c
 ## Install
 
 ```matlab
-addpath('/path/to/read_EDF');
+addpath('/path/to/EDF_toolbox');
 ```
 
 When used as part of `preraulab_utilities`, the top-level path setup handles this automatically.

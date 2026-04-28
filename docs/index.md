@@ -2,7 +2,7 @@
 hide-toc: false
 ---
 
-# read_EDF
+# EDF_toolbox
 
 ```{include} ../README.md
 :start-line: 1
