@@ -283,6 +283,7 @@ The CLI shells out to MATLAB once per invocation — startup cost (~10 s) is amo
 | `compile_edf_mex.m` | Shared auto-compile helper (vendored zlib + system libzstd) |
 | `zlib/` | Vendored zlib 1.3.2 source (BSD-style license). Compiled into both MEX files so there's no system zlib dependency. |
 | `header_gui.m` | Optional UI for inspecting header + signal-header tables |
+| `bench_convert_modes.m` | Benchmark helper: times `batch_convert_EDF` in serial / parallel / staged modes on a directory of EDFs and writes raw + summary CSVs. Useful for finding the right `Workers` / `WorkerThreads` / `StageDir` settings on a new machine. |
 
 If a pre-built MEX isn't available for your platform (Linux, Windows), `read_EDF.m` and `write_EDF.m` will auto-compile on first call. The build pulls in the vendored zlib (no system dep) and links against the system **libzstd** for `.edf.zst` support — the auto-compile script searches `/opt/homebrew` and `/usr/local` for it. To rebuild manually:
 
