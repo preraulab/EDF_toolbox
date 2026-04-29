@@ -121,9 +121,17 @@ if do_parallel
     % every Process-profile worker tries to use all cores for BLAS, so
     % N_workers x N_cores threads compete for N_cores -- resample tanks
     % and parfor runs slower than serial. Default worker_threads=1.
+    %
+    % parfevalOnAll is asynchronous, so we MUST wait() on the future
+    % before launching the parfor below -- otherwise the parfor may
+    % start while workers still have their default (all-cores) BLAS
+    % thread count, producing the very oversubscription this guards
+    % against. Skipping the wait was the root cause of bimodal "fast
+    % some runs, very slow other runs" timings under parfor.
     if do_parallel && ~isempty(pool)
         try
-            parfevalOnAll(pool, @maxNumCompThreads, 0, worker_threads);
+            fut = parfevalOnAll(pool, @maxNumCompThreads, 0, worker_threads);
+            wait(fut);
         catch ME
             if verbose
                 fprintf('  could not set worker BLAS threads (%s); continuing\n', ME.message);
