@@ -195,7 +195,18 @@ fprintf('%d / %d files converted, total elapsed %.1f s\n', ...
 disp(result(strcmp(result.status, 'failed'), {'input', 'error_message'}));
 ```
 
-**Staging on NFS / shared storage.** When inputs and outputs live on a shared network filesystem (NFS, Lustre, etc.), running multiple `parfor` workers against the same mount typically *slows things down* because the workers contend at the file server — each per-file conversion can take 5-10× longer than serial. Pass `'StageLocal', true` to copy each input to a local scratch directory first, run the conversion locally, then move the output back. Disk space required per worker is roughly one input file at a time.
+**Parallelism note — `WorkerThreads`.** `batch_convert_EDF` runs `parfor` across files. By default each parpool worker is pinned to **1 BLAS thread** (`'WorkerThreads', 1`). Without this pin, the default Process-profile worker tries to use every core for its internal BLAS pool, and `N_workers × N_cores` threads competing for `N_cores` causes catastrophic CPU contention — `resample`'s FIR filter slows down so much that parallel runs *4-8× slower than serial* on multi-core boxes. The default works correctly for almost every case; only override if you have a specific reason and spare cores.
+
+```matlab
+% Almost always correct: rely on the default WorkerThreads=1
+result = batch_convert_EDF('/data/edfs_in', 100, 'OutputDir', '/data/out');
+
+% Explicit if you know your workload is not BLAS-heavy:
+result = batch_convert_EDF('/data/edfs_in', 100, ...
+    'OutputDir', '/data/out', 'WorkerThreads', 2);
+```
+
+**Staging on NFS / shared storage.** When inputs and outputs live on a shared network filesystem (NFS, Lustre, etc.), running multiple `parfor` workers against the same mount can *slow things down* because the workers contend at the file server. Pass `'StageLocal', true` to copy each input to a local scratch directory first, run the conversion locally, then move the output back. Disk space required per worker is roughly one input file at a time. Note: the staging dir itself must be on real local storage — if the system tempdir is also NFS-mounted (some HPC setups), point `'StageDir'` at a known-local path like `/dev/shm` or `/scratch/$USER`.
 
 ```matlab
 % Stage to system tempdir (default) — fixes NFS contention almost always

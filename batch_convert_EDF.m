@@ -20,6 +20,13 @@ function result = batch_convert_EDF(input_spec, target_rate, varargin)
 %       'Parallel'     : true (default if a parpool exists). When true and no
 %                        pool exists, attempts to start one; falls back to
 %                        serial on failure.
+%       'WorkerThreads': integer >= 1 (default 1). BLAS / computational
+%                        threads per parpool worker. Default 1 prevents the
+%                        N_workers x N_cores oversubscription that
+%                        otherwise tanks resample's FIR filter performance
+%                        under parfor on multi-core boxes. Increase only if
+%                        your workload is not BLAS-heavy and you have spare
+%                        cores. Ignored when 'Parallel' is false.
 %       'StageLocal'   : false (default). When true, each file is first
 %                        copied to a local scratch directory, converted
 %                        there, then the output is moved to its final
@@ -57,6 +64,7 @@ addParameter(p, 'Compress',     true, @islogical);
 addParameter(p, 'GzipLevel',    6, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 9);
 addParameter(p, 'ZstdLevel',    3, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
 addParameter(p, 'Parallel',     [], @(x) isempty(x) || islogical(x));
+addParameter(p, 'WorkerThreads',1, @(x) isnumeric(x) && isscalar(x) && x >= 1);
 addParameter(p, 'StageLocal',   false, @islogical);
 addParameter(p, 'StageDir',     '', @ischar);
 addParameter(p, 'Pattern',      '*.edf', @ischar);
@@ -71,6 +79,7 @@ compress     = p.Results.Compress;
 gzip_level   = double(p.Results.GzipLevel);
 zstd_level   = double(p.Results.ZstdLevel);
 do_parallel  = p.Results.Parallel;
+worker_threads = round(double(p.Results.WorkerThreads));
 stage_local  = p.Results.StageLocal;
 stage_dir    = p.Results.StageDir;
 pattern      = p.Results.Pattern;
@@ -106,6 +115,19 @@ if do_parallel
         catch ME
             if verbose, fprintf('  parpool failed (%s); running serial\n', ME.message); end
             do_parallel = false;
+        end
+    end
+    % Pin each worker to worker_threads BLAS threads. Without this,
+    % every Process-profile worker tries to use all cores for BLAS, so
+    % N_workers x N_cores threads compete for N_cores -- resample tanks
+    % and parfor runs slower than serial. Default worker_threads=1.
+    if do_parallel && ~isempty(pool)
+        try
+            parfevalOnAll(pool, @maxNumCompThreads, 0, worker_threads);
+        catch ME
+            if verbose
+                fprintf('  could not set worker BLAS threads (%s); continuing\n', ME.message);
+            end
         end
     end
 end
