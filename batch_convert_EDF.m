@@ -41,11 +41,6 @@ function result = batch_convert_EDF(input_spec, target_rate, varargin)
 %       'Verbose'      : false (default)
 %       'AutoScale'    : 'recompute' (default) | 'preserve'. See convert_EDF
 %                        for the rationale on why 'recompute' is the default.
-%       'Precision'    : 'double' (default) | 'single'. Numeric class for
-%                        the resample call. See convert_EDF for the
-%                        precision/speed tradeoff -- short version: EDF
-%                        is int16 so single is essentially lossless and
-%                        may be faster on memory-bandwidth-bound boxes.
 %
 %   Output:
 %       result : table with columns
@@ -75,7 +70,6 @@ addParameter(p, 'StageDir',     '', @ischar);
 addParameter(p, 'Pattern',      '*.edf', @ischar);
 addParameter(p, 'Verbose',      false, @islogical);
 addParameter(p, 'AutoScale',    'recompute', @(s) any(strcmpi(s, {'preserve','recompute'})));
-addParameter(p, 'Precision',    'double', @(s) any(strcmpi(s, {'double','single'})));
 parse(p, input_spec, target_rate, varargin{:});
 
 target_rate  = double(p.Results.target_rate);
@@ -91,7 +85,6 @@ stage_dir    = p.Results.StageDir;
 pattern      = p.Results.Pattern;
 verbose      = p.Results.Verbose;
 autoscale    = p.Results.AutoScale;
-precision    = p.Results.Precision;
 
 if isempty(compress_mode)
     if compress, compress_mode = 'zstd'; else, compress_mode = 'none'; end
@@ -161,7 +154,7 @@ if do_parallel
     parfor k = 1:n
         [out_paths{k}, statuses{k}, elapsed_s(k), error_messages{k}] = ...
             run_one(files{k}, target_rate, out_dir, compress_mode, ...
-                    gzip_level, zstd_level, autoscale, precision, ...
+                    gzip_level, zstd_level, autoscale, ...
                     stage_local, stage_dir, false);
     end
 else
@@ -169,7 +162,7 @@ else
         if verbose, fprintf('  [%d/%d] %s\n', k, n, files{k}); end
         [out_paths{k}, statuses{k}, elapsed_s(k), error_messages{k}] = ...
             run_one(files{k}, target_rate, out_dir, compress_mode, ...
-                    gzip_level, zstd_level, autoscale, precision, ...
+                    gzip_level, zstd_level, autoscale, ...
                     stage_local, stage_dir, verbose);
     end
 end
@@ -186,7 +179,7 @@ end
 
 %% =========================================================================
 function [out_path, status, elapsed, errmsg] = run_one(in_fname, target_rate, ...
-    out_dir, compress_mode, gzip_level, zstd_level, autoscale, precision, ...
+    out_dir, compress_mode, gzip_level, zstd_level, autoscale, ...
     stage_local, stage_dir, verbose)
 
 t0 = tic;
@@ -237,8 +230,7 @@ try
             'GzipLevel',    gzip_level, ...
             'ZstdLevel',    zstd_level, ...
             'Verbose',      verbose, ...
-            'AutoScale',    autoscale, ...
-            'Precision',    precision);
+            'AutoScale',    autoscale);
 
         movefile(local_out, final_out, 'f');
     else
@@ -248,8 +240,7 @@ try
             'GzipLevel',    gzip_level, ...
             'ZstdLevel',    zstd_level, ...
             'Verbose',      verbose, ...
-            'AutoScale',    autoscale, ...
-            'Precision',    precision);
+            'AutoScale',    autoscale);
     end
 
     out_path = final_out;

@@ -30,15 +30,6 @@ function out_path = convert_EDF(in_fname, target_rate, varargin)
 %                        physical_min/max to the actual data range so the
 %                        anti-aliasing filter's ringing isn't clipped at
 %                        the source file's narrower stored range.
-%       'Precision'    : 'double' (default) | 'single'. Numeric class
-%                        used for resample(). EDF samples are int16
-%                        (~16 effective bits), so float32 has ~8 bits
-%                        of headroom and the filter math is essentially
-%                        lossless for this format. Setting 'single' may
-%                        speed up resample on memory-bandwidth-bound
-%                        machines by halving the bytes moved through
-%                        RAM. Output is cast back to double before
-%                        write_EDF for int16 quantization.
 %
 %   Output:
 %       out_path : full path of the written file
@@ -73,7 +64,6 @@ addParameter(p, 'GzipLevel',    6, @(x) isnumeric(x) && isscalar(x) && x >= 1 &&
 addParameter(p, 'ZstdLevel',    3, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
 addParameter(p, 'Verbose',      false, @islogical);
 addParameter(p, 'AutoScale',    'recompute', @(s) any(strcmpi(s, {'preserve','recompute'})));
-addParameter(p, 'Precision',    'double', @(s) any(strcmpi(s, {'double','single'})));
 parse(p, in_fname, target_rate, varargin{:});
 
 in_fname     = char(p.Results.in_fname);
@@ -85,7 +75,6 @@ gzip_level   = double(p.Results.GzipLevel);
 zstd_level   = double(p.Results.ZstdLevel);
 verbose      = p.Results.Verbose;
 autoscale    = p.Results.AutoScale;
-precision    = lower(p.Results.Precision);
 
 % Resolve compression mode. CompressMode wins; otherwise legacy Compress flag.
 if isempty(compress_mode)
@@ -173,18 +162,12 @@ for i = 1:n_signals
     end
 
     x = signal_cell{i};
-    if strcmp(precision, 'single')
-        x = single(x);
-    end
     cache_key = sprintf('%d_%d', P, Q);
     if isKey(resample_filter_cache, cache_key)
         y = resample(x(:), P, Q, resample_filter_cache(cache_key));
     else
         [y, b] = resample(x(:), P, Q);
         resample_filter_cache(cache_key) = b;
-    end
-    if isa(y, 'single')
-        y = double(y);  % write_EDF expects double for quantization
     end
     y = y(:)';   % keep row-vector convention used by read_EDF outputs
 
