@@ -336,6 +336,23 @@ Codec, parallelism, and verbosity work the same regardless of input shape:
 ./convert_edf -F 100 --out /out -v /in
 ```
 
+**Existing-output handling.** By default, if the intended output file already exists the input is skipped with a one-line warning — safe behavior for shared NFS data dirs. Three mutually-exclusive overrides (cp idiom):
+
+```sh
+# -i : prompt per-collision: [y]es / [n]o / [A]ll / [N]one
+./convert_edf -F 100 -R -i /data/study_root
+
+# -f : force overwrite of every existing output
+./convert_edf -F 100 -R -f /data/study_root
+
+# -n : silent skip (no warning), explicit form of the default
+./convert_edf -F 100 -R -n /data/study_root
+```
+
+If `-i` is used without a tty (piped, batch job, etc.) it falls back to skip-and-warn. Once the user picks `A` or `N` at any prompt, that decision sticks for the rest of the run.
+
+**Atomic writes.** All output is written to `<name>.partial` and atomically renamed to the final path on success. A Ctrl-C / SIGKILL / power-loss mid-write leaves only the `.partial` sibling — the final filename either does not exist or still holds the previous good copy. A subsequent re-run overwrites the orphan `.partial` and produces a fresh output. This means an existing final file is *always* a complete file (passes `gunzip -t` / `zstd -t`); you only need to worry about a partially-written file if you see a leftover `*.partial` in the tree.
+
 Notes:
 - Output paths and extensions: `-o FILE` (single-file mode) always wins regardless of `--compress`. In multi-file mode `-o` must be a directory; omit it to write in-situ next to each input. The codec flag drives the extension on every output.
 - Hidden files and directories (names starting with `.`) are skipped — no surprise pickups of `.DS_Store`, `.git`, etc.

@@ -22,10 +22,11 @@ mod edf;
 mod resample;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{ArgGroup, Parser, ValueEnum};
 use rayon::prelude::*;
-use std::io::Write;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -43,8 +44,33 @@ enum AutoScale {
     Recompute,
 }
 
+/// Policy for what to do when an intended output path already exists.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ClobberPolicy {
+    /// Default: skip the file and warn. Safe for shared NFS data dirs.
+    Warn,
+    /// `-n`: skip silently (cp -n idiom).
+    NoClobber,
+    /// `-f`: overwrite without asking.
+    Force,
+    /// `-i`: prompt with [y]es / [n]o / [A]ll / [N]one. Falls back to Warn
+    /// if stdin is not a tty.
+    Prompt,
+}
+
+/// Sticky decision from an interactive prompt. Once the user picks `A`
+/// (yes-to-all) or `N` (no-to-all), we apply that to every later collision
+/// in the same run without prompting again.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum StickyPrompt {
+    Undecided,
+    YesAll,
+    NoAll,
+}
+
 #[derive(Parser, Debug)]
 #[command(version, about = "Resample and rewrite EDF files")]
+#[command(group = ArgGroup::new("clobber").multiple(false).args(["interactive", "force", "no_clobber"]))]
 struct Args {
     /// Input files or directories (mixable). Directories are scanned for
     /// .edf / .edf.gz / .edf.zst; pass -R to recurse.
@@ -104,9 +130,40 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     jobs: usize,
 
+    /// Prompt before each existing-file overwrite ([y]es / [n]o / [A]ll /
+    /// [N]one). Falls back to skip-and-warn if stdin isn't a terminal.
+    /// Mutually exclusive with -f / -n.
+    #[arg(short = 'i', long)]
+    interactive: bool,
+
+    /// Force overwrite of existing output files without prompting.
+    /// Mutually exclusive with -i / -n.
+    #[arg(short = 'f', long)]
+    force: bool,
+
+    /// Skip silently if the output already exists (cp -n idiom). The default
+    /// (no flag) is the same skip behavior but with a one-line warning per
+    /// collision; -n suppresses the warning. Mutually exclusive with -i / -f.
+    #[arg(short = 'n', long)]
+    no_clobber: bool,
+
     /// Verbose output.
     #[arg(short = 'v', long)]
     verbose: bool,
+}
+
+impl Args {
+    fn clobber_policy(&self) -> ClobberPolicy {
+        if self.force {
+            ClobberPolicy::Force
+        } else if self.no_clobber {
+            ClobberPolicy::NoClobber
+        } else if self.interactive {
+            ClobberPolicy::Prompt
+        } else {
+            ClobberPolicy::Warn
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -126,6 +183,10 @@ fn main() -> Result<()> {
             .build_global()
             .ok();
     }
+
+    let clobber = args.clobber_policy();
+    // Sticky decision shared across rayon workers for `-i` interactive mode.
+    let prompt_state = Mutex::new(StickyPrompt::Undecided);
 
     // Collect (top_root, file_path) so we can mirror the source tree.
     // top_root is the user-supplied path under which file_path was found;
@@ -148,6 +209,9 @@ fn main() -> Result<()> {
             let is_dir = out.is_dir() || roots.iter().any(|r| r.is_dir());
             if !is_dir {
                 let (_root, input) = &pairs[0];
+                if !check_clobber(out, clobber, &prompt_state, args.verbose) {
+                    return Ok(());
+                }
                 let t0 = Instant::now();
                 convert_one(input, out, &args)?;
                 if args.verbose {
@@ -160,6 +224,9 @@ fn main() -> Result<()> {
             // No --out and one file: write next to the input.
             let (_root, input) = &pairs[0];
             let out = default_output_path(input, args.target_rate, args.compress);
+            if !check_clobber(&out, clobber, &prompt_state, args.verbose) {
+                return Ok(());
+            }
             let t0 = Instant::now();
             convert_one(input, &out, &args)?;
             if args.verbose {
@@ -201,7 +268,9 @@ fn main() -> Result<()> {
     // order; this counter is the user-visible "N of total done" tally.
     let done = std::sync::atomic::AtomicUsize::new(0);
     // Approximate ETA from the wall time so far. Cheap and good enough.
-    let outcomes: Vec<(PathBuf, Result<f64>)> = pairs
+    // Outcome value: Ok(Some(secs)) = converted, Ok(None) = skipped (existed),
+    // Err = failed.
+    let outcomes: Vec<(PathBuf, Result<Option<f64>>)> = pairs
         .par_iter()
         .map(|(root, input)| {
             let out = match &out_dir {
@@ -220,9 +289,19 @@ fn main() -> Result<()> {
                         Err(anyhow!("creating {}: {}", parent.display(), e)));
                 }
             }
+            // Honor the configured clobber policy. For `-i` (Prompt) the
+            // mutex inside check_clobber serializes prompts across workers.
+            if !check_clobber(&out, clobber, &prompt_state, args.verbose) {
+                let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if args.verbose {
+                    println!("[{}/{}] skip {} (output exists)", i, n, out.display());
+                    std::io::stdout().flush().ok();
+                }
+                return (input.clone(), Ok(None));
+            }
             let t1 = Instant::now();
             let result = match convert_one_quiet(input, &out, &args) {
-                Ok(()) => Ok(t1.elapsed().as_secs_f64()),
+                Ok(()) => Ok(Some(t1.elapsed().as_secs_f64())),
                 Err(e) => Err(e),
             };
             let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -234,9 +313,10 @@ fn main() -> Result<()> {
                     per * (n - i) as f64
                 } else { 0.0 };
                 match &result {
-                    Ok(secs) => println!(
+                    Ok(Some(secs)) => println!(
                         "[{}/{}] ok   {} ({:.2}s) | elapsed {:.0}s, ETA {:.0}s",
                         i, n, input.display(), secs, elapsed, eta),
+                    Ok(None) => {} // skip already announced above
                     Err(e) => println!(
                         "[{}/{}] fail {}: {:#}", i, n, input.display(), e),
                 }
@@ -248,20 +328,30 @@ fn main() -> Result<()> {
     let total = t0.elapsed().as_secs_f64();
 
     let mut ok = 0usize;
+    let mut skipped = 0usize;
     for (path, res) in &outcomes {
         match res {
-            Ok(_) => ok += 1,
+            Ok(Some(_)) => ok += 1,
+            Ok(None) => skipped += 1,
             // Always surface failures, even without -v (so silent runs
             // still tell you what didn't make it).
             Err(e) if !args.verbose => println!("[fail] {}: {:#}", path.display(), e),
             Err(_) => {}  // already printed live under -v
         }
     }
-    println!(
-        "done: {}/{} ok in {:.1}s wall ({:.2} files/s)",
-        ok, n, total, n as f64 / total
-    );
-    if ok < n {
+    let failed = n - ok - skipped;
+    if skipped > 0 {
+        println!(
+            "done: {}/{} ok, {} skipped, {} failed in {:.1}s wall ({:.2} files/s)",
+            ok, n, skipped, failed, total, n as f64 / total
+        );
+    } else {
+        println!(
+            "done: {}/{} ok in {:.1}s wall ({:.2} files/s)",
+            ok, n, total, n as f64 / total
+        );
+    }
+    if failed > 0 {
         std::process::exit(1);
     }
     Ok(())
@@ -466,6 +556,76 @@ fn compress_from_path(p: &Path) -> Option<Compress> {
     }
 }
 
+/// Decide whether to (over)write `out` given the configured clobber policy.
+/// Returns true if the caller should proceed with conversion + write.
+///
+/// `prompt_state` is shared across rayon workers so that the sticky
+/// All / None decisions made in one prompt stick globally for the rest of
+/// the run.
+fn check_clobber(
+    out: &Path,
+    policy: ClobberPolicy,
+    prompt_state: &Mutex<StickyPrompt>,
+    verbose: bool,
+) -> bool {
+    if !out.exists() {
+        return true;
+    }
+    match policy {
+        ClobberPolicy::Force => true,
+        ClobberPolicy::NoClobber => false,
+        ClobberPolicy::Warn => {
+            if verbose {
+                eprintln!(
+                    "[skip] {} already exists (use -f to overwrite, -i to prompt)",
+                    out.display()
+                );
+            } else {
+                eprintln!("[skip] {} already exists", out.display());
+            }
+            false
+        }
+        ClobberPolicy::Prompt => {
+            // Hold the lock for the entire prompt so concurrent workers
+            // don't interleave reads from stdin or writes of the prompt.
+            let mut sticky = prompt_state.lock().unwrap();
+            match *sticky {
+                StickyPrompt::YesAll => return true,
+                StickyPrompt::NoAll => return false,
+                StickyPrompt::Undecided => {}
+            }
+            if !std::io::stdin().is_terminal() {
+                eprintln!(
+                    "[skip] {} already exists (-i requires a tty; non-interactive run)",
+                    out.display()
+                );
+                return false;
+            }
+            print!(
+                "overwrite '{}'? [y]es / [n]o / [A]ll / [N]one: ",
+                out.display()
+            );
+            std::io::stdout().flush().ok();
+            let mut buf = String::new();
+            if std::io::stdin().lock().read_line(&mut buf).is_err() {
+                return false;
+            }
+            match buf.trim() {
+                "y" | "Y" | "yes" => true,
+                "A" | "all" => {
+                    *sticky = StickyPrompt::YesAll;
+                    true
+                }
+                "N" | "none" => {
+                    *sticky = StickyPrompt::NoAll;
+                    false
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
 fn convert_one(input: &Path, output: &Path, args: &Args) -> Result<()> {
     convert_one_inner(input, output, args, args.verbose)
 }
@@ -644,41 +804,67 @@ fn write_output(path: &Path, hdr: &edf::Header, data: &[Vec<i16>], args: &Args) 
     // even with the zstd default).
     let compress = compress_from_path(path).unwrap_or(args.compress);
 
-    let f = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    match compress {
-        Compress::None => {
-            let mut w = std::io::BufWriter::new(f);
-            edf::write_header(&mut w, hdr)?;
-            edf::write_data(&mut w, hdr, data)?;
-            w.flush()?;
+    // Atomic write: stream into <name>.partial, then rename to the final
+    // path on success. A Ctrl-C or crash mid-write leaves only the .partial
+    // sibling -- the final filename either does not exist or still holds
+    // the previous good copy. Rename is atomic on a single POSIX filesystem.
+    let tmp_name = format!(
+        "{}.partial",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or(".out")
+    );
+    let tmp = path.with_file_name(tmp_name);
+
+    let write_to_tmp = || -> Result<()> {
+        let f = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        match compress {
+            Compress::None => {
+                let mut w = std::io::BufWriter::new(f);
+                edf::write_header(&mut w, hdr)?;
+                edf::write_data(&mut w, hdr, data)?;
+                w.flush()?;
+            }
+            Compress::Gzip => {
+                // Parallel gzip via gzp -- output is standard gzip format,
+                // readable by gunzip / zlib / flate2 / MATLAB read_EDF.
+                use gzp::deflate::Gzip;
+                use gzp::par::compress::ParCompressBuilder;
+                use gzp::Compression as GzpCompression;
+                use gzp::ZWriter;
+                let lvl = GzpCompression::new(args.gzip_level);
+                let mut w = ParCompressBuilder::<Gzip>::new()
+                    .num_threads(num_cpus().max(1))
+                    .map_err(|e| anyhow!("gzp num_threads: {e:?}"))?
+                    .compression_level(lvl)
+                    .from_writer(f);
+                edf::write_header(&mut w, hdr)?;
+                edf::write_data(&mut w, hdr, data)?;
+                w.finish().map_err(|e| anyhow!("gzp finish: {e:?}"))?;
+            }
+            Compress::Zstd => {
+                let mut enc = zstd::stream::write::Encoder::new(f, args.zstd_level)?;
+                enc.multithread(num_cpus().max(1) as u32).ok();
+                let mut w = enc.auto_finish();
+                edf::write_header(&mut w, hdr)?;
+                edf::write_data(&mut w, hdr, data)?;
+                w.flush()?;
+            }
         }
-        Compress::Gzip => {
-            // Parallel gzip via gzp -- output is standard gzip format, readable
-            // by gunzip / zlib / flate2 / MATLAB read_EDF.
-            use gzp::deflate::Gzip;
-            use gzp::par::compress::ParCompressBuilder;
-            use gzp::Compression as GzpCompression;
-            use gzp::ZWriter;
-            let lvl = GzpCompression::new(args.gzip_level);
-            let mut w = ParCompressBuilder::<Gzip>::new()
-                .num_threads(num_cpus().max(1))
-                .map_err(|e| anyhow!("gzp num_threads: {e:?}"))?
-                .compression_level(lvl)
-                .from_writer(f);
-            edf::write_header(&mut w, hdr)?;
-            edf::write_data(&mut w, hdr, data)?;
-            w.finish().map_err(|e| anyhow!("gzp finish: {e:?}"))?;
+        Ok(())
+    };
+
+    match write_to_tmp() {
+        Ok(()) => {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
+            Ok(())
         }
-        Compress::Zstd => {
-            let mut enc = zstd::stream::write::Encoder::new(f, args.zstd_level)?;
-            enc.multithread(num_cpus().max(1) as u32).ok();
-            let mut w = enc.auto_finish();
-            edf::write_header(&mut w, hdr)?;
-            edf::write_data(&mut w, hdr, data)?;
-            w.flush()?;
+        Err(e) => {
+            // Best-effort cleanup of the half-written .partial.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
         }
     }
-    Ok(())
 }
 
 fn num_cpus() -> usize {
