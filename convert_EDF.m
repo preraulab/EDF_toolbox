@@ -131,6 +131,14 @@ for i = 1:n_signals
 end
 
 % --- Resample each non-annotation channel ----------------------------------
+% Filter design is cached by (P,Q) across calls so we don't re-run firls /
+% kaiser for every channel and every file. The cache is `persistent`, so
+% under parfor each worker builds up its own cache as it processes files.
+persistent resample_filter_cache
+if isempty(resample_filter_cache)
+    resample_filter_cache = containers.Map('KeyType', 'char', 'ValueType', 'any');
+end
+
 new_signal_cell = signal_cell;
 new_signal_header = signal_header;
 
@@ -154,7 +162,13 @@ for i = 1:n_signals
     end
 
     x = signal_cell{i};
-    y = resample(x(:), P, Q);
+    cache_key = sprintf('%d_%d', P, Q);
+    if isKey(resample_filter_cache, cache_key)
+        y = resample(x(:), P, Q, resample_filter_cache(cache_key));
+    else
+        [y, b] = resample(x(:), P, Q);
+        resample_filter_cache(cache_key) = b;
+    end
     y = y(:)';   % keep row-vector convention used by read_EDF outputs
 
     % Trim to integer multiple of new_spr
