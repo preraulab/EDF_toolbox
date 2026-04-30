@@ -266,6 +266,22 @@ cargo build --release
 # (on macOS with MacPorts: prepend AR=/usr/bin/ar RANLIB=/usr/bin/ranlib)
 ```
 
+**Put it on `$PATH`** so you can call `convert_edf` from any directory instead of `./target/release/convert_edf`:
+
+```sh
+# Option A — cargo install (recommended; installs to ~/.cargo/bin which is
+# already on $PATH for any user with a working Rust toolchain)
+cd rust && cargo install --path .
+
+# Option B — symlink the build output into a dir already on your $PATH
+ln -s "$(pwd)/rust/target/release/convert_edf" ~/.local/bin/convert_edf
+
+# Option C — extend $PATH in your shell rc
+echo 'export PATH="$HOME/EDF_toolbox/rust/target/release:$PATH"' >> ~/.bashrc
+```
+
+Once installed, drop the `./` prefix from every example below — `convert_edf -F 100 -R /data` works from anywhere.
+
 Defaults — `--compress gzip --gzip-level 9`, `--auto-scale recompute`, `--jobs 0` (= all cores) — are tuned for typical PSG batches. The CLI takes one or more positional inputs that may be files or directories, mixed:
 
 ```sh
