@@ -195,6 +195,19 @@ fn default_output_path(input: &Path, rate: f64, c: Compress) -> PathBuf {
     parent.join(format!("{}_{}Hz.{}", stem, rate as i64, ext))
 }
 
+fn compress_from_path(p: &Path) -> Option<Compress> {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.ends_with(".edf.gz") || name.ends_with(".gz") {
+        Some(Compress::Gzip)
+    } else if name.ends_with(".edf.zst") || name.ends_with(".zst") {
+        Some(Compress::Zstd)
+    } else if name.ends_with(".edf") {
+        Some(Compress::None)
+    } else {
+        None
+    }
+}
+
 fn convert_one(input: &Path, output: &Path, args: &Args) -> Result<()> {
     if args.verbose {
         eprintln!("opening {}", input.display());
@@ -356,8 +369,13 @@ fn write_output(path: &Path, hdr: &edf::Header, data: &[Vec<i16>], args: &Args) 
             std::fs::create_dir_all(parent)?;
         }
     }
+    // If the output path's extension implies a different compression than
+    // --compress, the path wins (so `-o foo.edf.gz` does what you'd expect
+    // even with the zstd default).
+    let compress = compress_from_path(path).unwrap_or(args.compress);
+
     let f = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    let mut writer: Box<dyn Write> = match args.compress {
+    let mut writer: Box<dyn Write> = match compress {
         Compress::None => Box::new(std::io::BufWriter::new(f)),
         Compress::Gzip => Box::new(flate2::write::GzEncoder::new(f, flate2::Compression::new(args.gzip_level))),
         Compress::Zstd => {
