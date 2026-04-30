@@ -35,7 +35,7 @@ For one-shot batch conversion of many files, the **standalone Rust binary** is ~
 
 ```sh
 cd rust && cargo build --release
-./target/release/convert_edf --batch /path/to/edfs -F 100 --out /path/out
+./target/release/convert_edf -F 100 --out /path/out /path/to/edfs
 # default output: .edf.gz (gzip-9, parallel, all cores)
 ```
 
@@ -313,7 +313,6 @@ Codec, parallelism, and verbosity work the same regardless of input shape:
 Notes:
 - Output paths and extensions: `-o FILE` (single-file mode) always wins regardless of `--compress`. In multi-file mode `-o` must be a directory and the codec flag drives the extension on every output.
 - Hidden files and directories (names starting with `.`) are skipped — no surprise pickups of `.DS_Store`, `.git`, etc.
-- The legacy `--batch DIR` flag is still accepted but undocumented; new code should pass the directory positionally.
 
 The Rust binary defaults to gzip-9 while MATLAB defaults to zstd-9 because MATLAB's gzip path is single-threaded; the parallel-gzip win in `gzp` does not transfer there. On a 24-core box the Rust pipeline finishes a 10-file batch in ~11 s vs ~38 s for MATLAB.
 

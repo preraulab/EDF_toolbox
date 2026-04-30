@@ -50,11 +50,6 @@ struct Args {
     /// .edf / .edf.gz / .edf.zst; pass -R to recurse.
     inputs: Vec<PathBuf>,
 
-    /// Backward-compat alias for passing a single directory positionally.
-    /// Prefer the positional form: `convert_edf -F 100 --out OUT /path/to/dir`.
-    #[arg(long, hide = true)]
-    batch: Option<PathBuf>,
-
     /// Recurse into subdirectories of any directory inputs.
     #[arg(short = 'R', long)]
     recursive: bool,
@@ -117,13 +112,9 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Merge positional inputs and the legacy --batch alias.
-    let mut roots: Vec<PathBuf> = args.inputs.clone();
-    if let Some(b) = &args.batch {
-        roots.push(b.clone());
-    }
+    let roots: Vec<PathBuf> = args.inputs.clone();
     if roots.is_empty() {
-        bail!("no inputs given (pass FILE..., DIR..., or --batch DIR)");
+        bail!("no inputs given (pass one or more FILE / DIR arguments)");
     }
     if !args.read_bench && args.target_rate <= 0.0 {
         bail!("--target-rate / -F is required (or pass --read-bench to skip conversion)");
