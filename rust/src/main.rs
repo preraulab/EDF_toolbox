@@ -375,18 +375,39 @@ fn write_output(path: &Path, hdr: &edf::Header, data: &[Vec<i16>], args: &Args) 
     let compress = compress_from_path(path).unwrap_or(args.compress);
 
     let f = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    let mut writer: Box<dyn Write> = match compress {
-        Compress::None => Box::new(std::io::BufWriter::new(f)),
-        Compress::Gzip => Box::new(flate2::write::GzEncoder::new(f, flate2::Compression::new(args.gzip_level))),
+    match compress {
+        Compress::None => {
+            let mut w = std::io::BufWriter::new(f);
+            edf::write_header(&mut w, hdr)?;
+            edf::write_data(&mut w, hdr, data)?;
+            w.flush()?;
+        }
+        Compress::Gzip => {
+            // Parallel gzip via gzp -- output is standard gzip format, readable
+            // by gunzip / zlib / flate2 / MATLAB read_EDF.
+            use gzp::deflate::Gzip;
+            use gzp::par::compress::ParCompressBuilder;
+            use gzp::Compression as GzpCompression;
+            use gzp::ZWriter;
+            let lvl = GzpCompression::new(args.gzip_level);
+            let mut w = ParCompressBuilder::<Gzip>::new()
+                .num_threads(num_cpus().max(1))
+                .map_err(|e| anyhow!("gzp num_threads: {e:?}"))?
+                .compression_level(lvl)
+                .from_writer(f);
+            edf::write_header(&mut w, hdr)?;
+            edf::write_data(&mut w, hdr, data)?;
+            w.finish().map_err(|e| anyhow!("gzp finish: {e:?}"))?;
+        }
         Compress::Zstd => {
             let mut enc = zstd::stream::write::Encoder::new(f, args.zstd_level)?;
             enc.multithread(num_cpus().max(1) as u32).ok();
-            Box::new(enc.auto_finish())
+            let mut w = enc.auto_finish();
+            edf::write_header(&mut w, hdr)?;
+            edf::write_data(&mut w, hdr, data)?;
+            w.flush()?;
         }
-    };
-    edf::write_header(&mut writer, hdr)?;
-    edf::write_data(&mut writer, hdr, data)?;
-    writer.flush()?;
+    }
     Ok(())
 }
 

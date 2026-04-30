@@ -12,6 +12,7 @@ anyhow = "1"
 byteorder = "1"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
+gzp = { version = "0.11", default-features = false, features = ["deflate_default"] }
 zstd = { version = "0.13", features = ["zstdmt"] }
 rayon = "1"
 rubato = "0.16"
