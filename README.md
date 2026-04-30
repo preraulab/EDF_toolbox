@@ -291,6 +291,16 @@ Recursive output is mirrored into `--out` by default — e.g. `/in/sub/foo.edf` 
 ./convert_edf -F 100 --out /flat -R --flatten /data/study_root
 ```
 
+**In-situ (in-place) writes.** Omit `--out` to write each output next to its input, leaving the source tree's structure intact. This is the right mode for compressing a complicated study tree without setting up a parallel output directory:
+
+```sh
+# For each foo.edf anywhere under /data/study_root, write
+# foo_100Hz.edf.gz right beside it; original .edf is left untouched.
+./convert_edf -F 100 -R /data/study_root
+```
+
+Re-running in-situ at the same rate is idempotent: the directory walk skips files matching the output naming pattern (`*_<rate>Hz.edf*`) so you do not get `_100Hz_100Hz.edf.gz` artifacts. Re-running at a *different* rate (e.g. -F 50) does pick up those earlier outputs as legitimate inputs and produces a new set alongside.
+
 Codec, parallelism, and verbosity work the same regardless of input shape:
 
 ```sh
@@ -311,8 +321,9 @@ Codec, parallelism, and verbosity work the same regardless of input shape:
 ```
 
 Notes:
-- Output paths and extensions: `-o FILE` (single-file mode) always wins regardless of `--compress`. In multi-file mode `-o` must be a directory and the codec flag drives the extension on every output.
+- Output paths and extensions: `-o FILE` (single-file mode) always wins regardless of `--compress`. In multi-file mode `-o` must be a directory; omit it to write in-situ next to each input. The codec flag drives the extension on every output.
 - Hidden files and directories (names starting with `.`) are skipped — no surprise pickups of `.DS_Store`, `.git`, etc.
+- Files matching the output naming pattern (`*_<rate>Hz.edf*`) are skipped during directory walks at the *same* rate, so re-runs are idempotent. Explicit positional file arguments are always honored even if their names match this pattern.
 
 The Rust binary defaults to gzip-9 while MATLAB defaults to zstd-9 because MATLAB's gzip path is single-threaded; the parallel-gzip win in `gzp` does not transfer there. On a 24-core box the Rust pipeline finishes a 10-file batch in ~11 s vs ~38 s for MATLAB.
 

@@ -130,7 +130,7 @@ fn main() -> Result<()> {
     // Collect (top_root, file_path) so we can mirror the source tree.
     // top_root is the user-supplied path under which file_path was found;
     // for a single file argument, top_root is the file's parent directory.
-    let pairs = collect_inputs(&roots, args.recursive)?;
+    let pairs = collect_inputs(&roots, args.recursive, args.target_rate)?;
 
     if args.read_bench {
         return run_read_bench_pairs(&pairs);
@@ -170,28 +170,38 @@ fn main() -> Result<()> {
         }
     }
 
-    // Multi-file / directory mode. --out must be a directory.
-    let out_dir = args
-        .out
-        .clone()
-        .ok_or_else(|| anyhow!("--out DIR is required when converting multiple files or a directory"))?;
-    if out_dir.is_file() {
-        bail!(
-            "--out points at a regular file ({}) but {} inputs were given; \
-             pass a directory in multi-file mode",
-            out_dir.display(),
-            pairs.len()
-        );
+    // Multi-file / directory mode. --out is optional:
+    //   - given:   write outputs under that directory (mirrored or flat)
+    //   - omitted: write each output next to its input (in-situ)
+    let out_dir = args.out.clone();
+    if let Some(d) = &out_dir {
+        if d.is_file() {
+            bail!(
+                "--out points at a regular file ({}) but {} inputs were given; \
+                 pass a directory in multi-file mode (or omit --out to write in-situ)",
+                d.display(),
+                pairs.len()
+            );
+        }
+        std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
     }
-    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
-    println!("convert_edf: {} files, target {} Hz", pairs.len(), args.target_rate);
+    let mode_msg = match &out_dir {
+        Some(d) if args.flatten => format!("--out {} (flat)", d.display()),
+        Some(d)                 => format!("--out {} (mirrored)", d.display()),
+        None                    => "in-situ (writing next to each input)".to_string(),
+    };
+    println!("convert_edf: {} files, target {} Hz, {}",
+             pairs.len(), args.target_rate, mode_msg);
 
     let t0 = Instant::now();
     let outcomes: Vec<(PathBuf, Result<f64>)> = pairs
         .par_iter()
         .map(|(root, input)| {
-            let out = mirror_out_path(root, input, &out_dir, args.target_rate, args.compress, args.flatten);
+            let out = match &out_dir {
+                Some(d) => mirror_out_path(root, input, d, args.target_rate, args.compress, args.flatten),
+                None    => default_output_path(input, args.target_rate, args.compress),
+            };
             // Ensure parent dir of `out` exists (mirrored subdirs).
             if let Some(parent) = out.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
@@ -287,11 +297,41 @@ fn is_edf_filename(name: &str) -> bool {
     name.ends_with(".edf") || name.ends_with(".edf.gz") || name.ends_with(".edf.zst")
 }
 
+/// True if `name` looks like one of *our* output files for the given target
+/// rate -- e.g. "foo_100Hz.edf.gz" when rate=100. Used to make in-situ
+/// recursive runs idempotent: a second pass over a tree that already
+/// contains "_100Hz.edf*" outputs from a previous run skips them instead of
+/// producing "_100Hz_100Hz.edf*" garbage. Skip is silent.
+///
+/// Only filters during directory walks. Explicit positional file arguments
+/// are always honored even if they match this pattern -- if the user names
+/// the file by hand, they meant it.
+fn looks_like_our_output_at_rate(name: &str, rate: f64) -> bool {
+    let bare = name
+        .strip_suffix(".zst")
+        .or_else(|| name.strip_suffix(".gz"))
+        .unwrap_or(name);
+    if let Some(stem) = bare.strip_suffix(".edf") {
+        let needle = format!("_{}Hz", rate as i64);
+        stem.ends_with(&needle)
+    } else {
+        false
+    }
+}
+
 /// Resolve user-supplied root paths into a list of (root, file) pairs.
 /// `root` is the original positional argument under which `file` was
 /// discovered; for a file argument the root is the file's parent directory
 /// (so the relative-path-from-root is just the basename).
-fn collect_inputs(roots: &[PathBuf], recursive: bool) -> Result<Vec<(PathBuf, PathBuf)>> {
+///
+/// `target_rate` is used to filter our own past outputs out of directory
+/// walks (idempotent re-runs). Pass 0.0 to disable the filter (e.g. for
+/// --read-bench, which has no rate to compare against).
+fn collect_inputs(
+    roots: &[PathBuf],
+    recursive: bool,
+    target_rate: f64,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
     let mut out = Vec::new();
     for root in roots {
         if !root.exists() {
@@ -305,7 +345,7 @@ fn collect_inputs(roots: &[PathBuf], recursive: bool) -> Result<Vec<(PathBuf, Pa
             let parent = root.parent().unwrap_or_else(|| Path::new("."));
             out.push((parent.to_path_buf(), root.clone()));
         } else if root.is_dir() {
-            walk_dir(root, root, recursive, &mut out)?;
+            walk_dir(root, root, recursive, target_rate, &mut out)?;
         } else {
             bail!("input is not a regular file or directory: {}", root.display());
         }
@@ -316,11 +356,13 @@ fn collect_inputs(roots: &[PathBuf], recursive: bool) -> Result<Vec<(PathBuf, Pa
 
 /// Recursive (or single-level) directory walker. Skips hidden entries
 /// (names starting with '.') so we don't pick up macOS .DS_Store, .git,
-/// etc. by accident.
+/// etc. by accident, and skips files matching our own output pattern at
+/// `target_rate` to keep in-situ re-runs idempotent.
 fn walk_dir(
     root: &Path,
     dir: &Path,
     recursive: bool,
+    target_rate: f64,
     out: &mut Vec<(PathBuf, PathBuf)>,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
@@ -333,11 +375,13 @@ fn walk_dir(
         }
         let ft = entry.file_type()?;
         if ft.is_file() {
-            if is_edf_filename(&name_str) {
+            if is_edf_filename(&name_str)
+                && !(target_rate > 0.0 && looks_like_our_output_at_rate(&name_str, target_rate))
+            {
                 out.push((root.to_path_buf(), p));
             }
         } else if ft.is_dir() && recursive {
-            walk_dir(root, &p, recursive, out)?;
+            walk_dir(root, &p, recursive, target_rate, out)?;
         }
     }
     Ok(())
