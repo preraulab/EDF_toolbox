@@ -1,63 +1,86 @@
-//! Resampling using rubato (pure Rust, polyphase FIR with sinc interpolation).
+//! Resampling using rubato's FftFixedIn (FFT-based fixed-ratio resampler).
 //!
-//! This is the convert pipeline:
-//!   int16 samples -> f32 (apply scale+offset to physical units)
-//!   -> rubato resampler (sinc, ratio P/Q)
-//!   -> f32 output samples
-//!   -> caller's responsibility to quantize back to int16
+//! For fixed integer ratios this is significantly faster than the
+//! direct-form sinc resampler: an FFT-domain anti-alias multiply replaces
+//! the per-sample convolution.
+//!
+//! [`resample_channels`] runs all channels through one resampler instance
+//! in lockstep, which is meaningfully faster than instantiating a fresh
+//! resampler per channel (each instance allocates FFT plans + buffers).
 
 use anyhow::{Context, Result};
-use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-};
+use rubato::{FftFixedIn, Resampler};
 
-/// Resample a single channel from `orig_rate` to `target_rate`.
-/// Input is in physical units (f32). Output is also f32.
-pub fn resample_channel(x: &[f32], orig_rate: f64, target_rate: f64) -> Result<Vec<f32>> {
+/// Resample several channels (each is a `Vec<f32>`, all the same length)
+/// from `orig_rate` to `target_rate`. Returns one resampled `Vec<f32>` per
+/// input channel.
+pub fn resample_channels(
+    channels: &[Vec<f32>],
+    orig_rate: f64,
+    target_rate: f64,
+) -> Result<Vec<Vec<f32>>> {
+    if channels.is_empty() {
+        return Ok(Vec::new());
+    }
     if (orig_rate - target_rate).abs() < 1e-9 {
-        return Ok(x.to_vec());
+        return Ok(channels.to_vec());
     }
+    let in_rate = orig_rate.round() as usize;
+    let out_rate = target_rate.round() as usize;
+    if in_rate == 0 || out_rate == 0 {
+        anyhow::bail!("non-integer-Hz resample not supported");
+    }
+    let n_in = channels[0].len();
+    for c in channels {
+        if c.len() != n_in {
+            anyhow::bail!("resample_channels: all channels must have equal length");
+        }
+    }
+    let nbr_channels = channels.len();
 
-    let ratio = target_rate / orig_rate;
+    let chunk_size_in = 1024;
+    let sub_chunks = 2;
+    let mut resampler = FftFixedIn::<f32>::new(
+        in_rate,
+        out_rate,
+        chunk_size_in,
+        sub_chunks,
+        nbr_channels,
+    )
+    .context("creating FftFixedIn resampler")?;
 
-    // Kaiser-windowed sinc params, tuned to roughly match MATLAB resample's
-    // default (10 zero-crossings per side, beta=5).
-    let params = SincInterpolationParameters {
-        sinc_len: 256,
-        f_cutoff: 0.95,
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor: 256,
-        window: WindowFunction::BlackmanHarris2,
-    };
+    let needed = resampler.input_frames_next();
+    let est_out = ((n_in as f64) * target_rate / orig_rate) as usize + needed;
+    let mut output: Vec<Vec<f32>> =
+        (0..nbr_channels).map(|_| Vec::with_capacity(est_out)).collect();
 
-    let chunk_size = 1 << 14; // 16384 samples per chunk
-    let mut resampler = SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_size, 1)
-        .context("creating SincFixedIn resampler")?;
+    // Per-call input buffer: outer = channels, inner = chunk samples
+    let mut inbuf: Vec<Vec<f32>> = (0..nbr_channels).map(|_| vec![0.0f32; needed]).collect();
 
-    let mut output = Vec::<f32>::with_capacity((x.len() as f64 * ratio) as usize + 1024);
     let mut pos = 0usize;
-    let n = x.len();
-
-    // Feed full chunks
-    while pos + chunk_size <= n {
-        let inbuf = vec![x[pos..pos + chunk_size].to_vec()];
-        let out = resampler.process(&inbuf, None).context("resampler chunk")?;
-        output.extend_from_slice(&out[0]);
-        pos += chunk_size;
-    }
-    // Pad the trailing block to chunk_size (rubato's SincFixedIn requires
-    // exact-sized blocks). Trim the corresponding output to discard the
-    // padding's filtered contribution.
-    if pos < n {
-        let remain = n - pos;
-        let mut padded = Vec::with_capacity(chunk_size);
-        padded.extend_from_slice(&x[pos..]);
-        padded.resize(chunk_size, 0.0);
-        let inbuf = vec![padded];
-        let out = resampler.process(&inbuf, None).context("resampler tail")?;
-        let keep = (remain as f64 * ratio).round() as usize;
-        let take = keep.min(out[0].len());
-        output.extend_from_slice(&out[0][..take]);
+    while pos < n_in {
+        let real_in = (n_in - pos).min(needed);
+        for (ci, ch) in channels.iter().enumerate() {
+            inbuf[ci][..real_in].copy_from_slice(&ch[pos..pos + real_in]);
+            if real_in < needed {
+                inbuf[ci][real_in..].fill(0.0);
+            }
+        }
+        let out = resampler.process(&inbuf, None).context("resampler block")?;
+        if real_in == needed {
+            for (ci, oc) in output.iter_mut().enumerate() {
+                oc.extend_from_slice(&out[ci]);
+            }
+        } else {
+            // Tail: output corresponds to real_in real samples plus padding.
+            let real_out = (real_in as f64 * target_rate / orig_rate).round() as usize;
+            for (ci, oc) in output.iter_mut().enumerate() {
+                let take = real_out.min(out[ci].len());
+                oc.extend_from_slice(&out[ci][..take]);
+            }
+            break;
+        }
+        pos += needed;
     }
 
     Ok(output)

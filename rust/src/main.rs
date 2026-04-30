@@ -225,62 +225,6 @@ fn convert_one(input: &Path, output: &Path, args: &Args) -> Result<()> {
     let target_rate = args.target_rate;
     let record_duration = hdr.data_record_duration;
 
-    // For each non-annotation signal: physical decode -> resample -> int16 quantize.
-    let new_data: Vec<Vec<i16>> = (0..hdr.signals.len())
-        .map(|si| {
-            let s = &hdr.signals[si];
-            if s.is_annotations() {
-                // Pass through verbatim.
-                return Ok::<Vec<i16>, anyhow::Error>(data_i16[si].clone());
-            }
-            let orig_rate = s.sampling_frequency(record_duration);
-            let scale = s.scale() as f32;
-            let offset = s.offset() as f32;
-            let xphys: Vec<f32> = data_i16[si]
-                .iter()
-                .map(|&v| (v as f32) * scale + offset)
-                .collect();
-
-            let yphys = if (orig_rate - target_rate).abs() < 1e-9 {
-                xphys
-            } else {
-                resample::resample_channel(&xphys, orig_rate, target_rate)?
-            };
-            Ok(yphys
-                .iter()
-                .copied()
-                .collect::<Vec<f32>>()
-                .iter()
-                .map(|v| *v) // placeholder; real quantize below
-                .collect::<Vec<f32>>()
-                .iter()
-                .map(|_| 0i16)
-                .collect()) // dummy; replaced below
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // The closure above can't mutate the header (we need to rewrite
-    // physical_min/max under recompute and samples_per_record under any rate
-    // change), so do the f32 -> i16 conversion + header update here in a
-    // second pass.
-    let new_data = quantize_and_update_header(&mut hdr, target_rate, record_duration, &data_i16, &new_data, args.auto_scale)?;
-
-    write_output(output, &hdr, &new_data, args)
-}
-
-fn quantize_and_update_header(
-    hdr: &mut edf::Header,
-    target_rate: f64,
-    record_duration: f64,
-    orig_data_i16: &[Vec<i16>],
-    _placeholder: &[Vec<i16>],
-    auto_scale: AutoScale,
-) -> Result<Vec<Vec<i16>>> {
-    // Re-do the resample here so we have f32 to quantize correctly. (The
-    // first-pass closure above couldn't return both f32 and i16 cleanly, and
-    // duplicating work is acceptable for now -- this is a draft pipeline,
-    // not a perf-tuned one. We'll fold the two passes together once correctness
-    // is verified.)
     let new_spr_f = target_rate * record_duration;
     if (new_spr_f - new_spr_f.round()).abs() > 1e-9 {
         bail!(
@@ -290,30 +234,64 @@ fn quantize_and_update_header(
     }
     let new_spr = new_spr_f.round() as u32;
 
+    // --- Group signals by (orig_rate, input length) ---
+    // Same-group channels are resampled together with one FftFixedIn instance,
+    // amortizing FFT plan setup + buffer alloc across all channels of that rate.
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<(u64, usize), Vec<usize>> = BTreeMap::new();
+    for (si, sig) in hdr.signals.iter().enumerate() {
+        if sig.is_annotations() {
+            continue;
+        }
+        let orig_rate = sig.sampling_frequency(record_duration);
+        let key = (orig_rate.to_bits(), data_i16[si].len());
+        groups.entry(key).or_default().push(si);
+    }
+
+    // f32 resampled outputs, indexed by signal index. Annotations stay None.
+    let mut yphys_per_signal: Vec<Option<Vec<f32>>> = (0..hdr.signals.len()).map(|_| None).collect();
+
+    for ((orig_rate_bits, _len), idxs) in &groups {
+        let orig_rate = f64::from_bits(*orig_rate_bits);
+        // Decode i16 -> f32 for each channel of the group
+        let xphys: Vec<Vec<f32>> = idxs
+            .iter()
+            .map(|&si| {
+                let s = &hdr.signals[si];
+                let scale = s.scale() as f32;
+                let offset = s.offset() as f32;
+                data_i16[si]
+                    .iter()
+                    .map(|&v| (v as f32) * scale + offset)
+                    .collect()
+            })
+            .collect();
+
+        let yphys: Vec<Vec<f32>> = if (orig_rate - target_rate).abs() < 1e-9 {
+            xphys
+        } else {
+            resample::resample_channels(&xphys, orig_rate, target_rate)?
+        };
+
+        for (k, &si) in idxs.iter().enumerate() {
+            yphys_per_signal[si] = Some(yphys[k].clone());
+        }
+    }
+
+    // --- Quantize back to int16 + update header ---
     let mut new_signals = Vec::with_capacity(hdr.signals.len());
-    let mut new_data = Vec::with_capacity(hdr.signals.len());
+    let mut new_data: Vec<Vec<i16>> = Vec::with_capacity(hdr.signals.len());
     let mut min_records = i64::MAX;
     for (si, sig) in hdr.signals.iter().enumerate() {
         if sig.is_annotations() {
             new_signals.push(sig.clone());
-            new_data.push(orig_data_i16[si].clone());
+            new_data.push(data_i16[si].clone());
             continue;
         }
-        let orig_rate = sig.sampling_frequency(record_duration);
-        let scale = sig.scale() as f32;
-        let offset = sig.offset() as f32;
-        let xphys: Vec<f32> = orig_data_i16[si]
-            .iter()
-            .map(|&v| (v as f32) * scale + offset)
-            .collect();
+        let yphys = yphys_per_signal[si]
+            .as_ref()
+            .expect("non-annotation signal missing resampled data");
 
-        let yphys = if (orig_rate - target_rate).abs() < 1e-9 {
-            xphys
-        } else {
-            resample::resample_channel(&xphys, orig_rate, target_rate)?
-        };
-
-        // Trim to integer multiple of new_spr
         let nrec = (yphys.len() / new_spr as usize) as i64;
         if nrec < 1 {
             bail!("signal '{}' has no full records after resample", sig.label.trim());
@@ -324,18 +302,13 @@ fn quantize_and_update_header(
         let len = nrec as usize * new_spr as usize;
         let yphys = &yphys[..len];
 
-        // Determine physical_min/max for quantization
-        let (pmin, pmax) = match auto_scale {
+        let (pmin, pmax) = match args.auto_scale {
             AutoScale::Preserve => (sig.physical_min, sig.physical_max),
             AutoScale::Recompute => {
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
                 for &v in yphys {
-                    if v < lo {
-                        lo = v;
-                    }
-                    if v > hi {
-                        hi = v;
-                    }
+                    if v < lo { lo = v; }
+                    if v > hi { hi = v; }
                 }
                 if !lo.is_finite() || !hi.is_finite() || (hi - lo) < 1e-30 {
                     (sig.physical_min, sig.physical_max)
@@ -348,8 +321,8 @@ fn quantize_and_update_header(
         let dmin: i32 = -32768;
         let dmax: i32 = 32767;
         let new_scale = (pmax - pmin) / (dmax - dmin) as f64;
-        let new_offset = pmin - new_scale * dmin as f64;
         let new_scale = if new_scale == 0.0 { 1.0 } else { new_scale };
+        let new_offset = pmin - new_scale * dmin as f64;
         let new_data_sig: Vec<i16> = yphys
             .iter()
             .map(|&v| {
@@ -369,13 +342,12 @@ fn quantize_and_update_header(
     }
 
     if min_records == i64::MAX {
-        // No non-annotation signals (unusual). Keep original record count.
         min_records = hdr.num_data_records;
     }
-
     hdr.signals = new_signals;
     hdr.num_data_records = min_records;
-    Ok(new_data)
+
+    write_output(output, &hdr, &new_data, args)
 }
 
 fn write_output(path: &Path, hdr: &edf::Header, data: &[Vec<i16>], args: &Args) -> Result<()> {
