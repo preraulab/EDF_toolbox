@@ -1,0 +1,405 @@
+//! convert_edf -- standalone EDF resample / rewrite tool.
+//!
+//! Usage:
+//!   convert_edf input.edf -r 100 -o output.edf.zst
+//!   convert_edf --batch /path/to/edfs -r 100 --jobs 4 --out-dir /path/to/out
+//!
+//! Pipeline per file:
+//!   read EDF (auto-detect .edf / .edf.gz / .edf.zst)
+//!   for each non-annotation signal:
+//!     int16 -> f32 (physical units)
+//!     resample at target_rate
+//!     f32 -> int16 (recompute physical_min/max from data range, by default)
+//!   write EDF (auto-pick .edf / .edf.gz / .edf.zst by output extension)
+
+mod edf;
+mod resample;
+
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{Parser, ValueEnum};
+use rayon::prelude::*;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Compress {
+    None,
+    Gzip,
+    Zstd,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum AutoScale {
+    /// Keep source physical_min/max. Filter ringing may clip to int16 range.
+    Preserve,
+    /// Recompute physical_min/max from resampled-channel data range. (default)
+    Recompute,
+}
+
+#[derive(Parser, Debug)]
+#[command(version, about = "Resample and rewrite EDF files")]
+struct Args {
+    /// Input file. Mutually exclusive with --batch.
+    input: Option<PathBuf>,
+
+    /// Batch mode: process every *.edf / *.edf.gz / *.edf.zst under this dir.
+    #[arg(long)]
+    batch: Option<PathBuf>,
+
+    /// Target sampling rate (Hz).
+    #[arg(short = 'r', long)]
+    target_rate: f64,
+
+    /// Output file (single-input mode) or output directory (batch mode).
+    #[arg(short = 'o', long)]
+    out: Option<PathBuf>,
+
+    /// Compression for output. Default: zstd.
+    #[arg(long, value_enum, default_value_t = Compress::Zstd)]
+    compress: Compress,
+
+    /// Zstd compression level (1-22).
+    #[arg(long, default_value_t = 3)]
+    zstd_level: i32,
+
+    /// Gzip compression level (1-9).
+    #[arg(long, default_value_t = 6)]
+    gzip_level: u32,
+
+    /// Auto-rescale physical_min/max to fit resampled data range.
+    #[arg(long, value_enum, default_value_t = AutoScale::Recompute)]
+    auto_scale: AutoScale,
+
+    /// Number of parallel workers in batch mode (0 = use rayon default).
+    #[arg(long, default_value_t = 0)]
+    jobs: usize,
+
+    /// Verbose output.
+    #[arg(short = 'v', long)]
+    verbose: bool,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    if args.input.is_none() == args.batch.is_none() {
+        bail!("specify either INPUT or --batch DIR (exactly one)");
+    }
+
+    if args.jobs > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(args.jobs)
+            .build_global()
+            .ok();
+    }
+
+    if let Some(input) = &args.input {
+        let out = args
+            .out
+            .clone()
+            .unwrap_or_else(|| default_output_path(input, args.target_rate, args.compress));
+        let t0 = Instant::now();
+        convert_one(input, &out, &args)?;
+        if args.verbose {
+            println!("{} -> {} in {:.2}s", input.display(), out.display(), t0.elapsed().as_secs_f64());
+        }
+        return Ok(());
+    }
+
+    let in_dir = args.batch.as_ref().unwrap();
+    let out_dir = args
+        .out
+        .clone()
+        .ok_or_else(|| anyhow!("--out DIR is required in batch mode"))?;
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+
+    let inputs = list_edfs(in_dir)?;
+    if inputs.is_empty() {
+        bail!("no EDFs found under {}", in_dir.display());
+    }
+    println!("convert_edf: {} files, target {} Hz", inputs.len(), args.target_rate);
+
+    let t0 = Instant::now();
+    let outcomes: Vec<(PathBuf, Result<f64>)> = inputs
+        .par_iter()
+        .map(|input| {
+            let out = out_path_for(input, &out_dir, args.target_rate, args.compress);
+            let t1 = Instant::now();
+            match convert_one(input, &out, &args) {
+                Ok(()) => (input.clone(), Ok(t1.elapsed().as_secs_f64())),
+                Err(e) => (input.clone(), Err(e)),
+            }
+        })
+        .collect();
+    let total = t0.elapsed().as_secs_f64();
+
+    let mut ok = 0usize;
+    for (path, res) in &outcomes {
+        match res {
+            Ok(secs) => {
+                ok += 1;
+                if args.verbose {
+                    println!("[ok]   {} ({:.2}s)", path.display(), secs);
+                }
+            }
+            Err(e) => println!("[fail] {}: {:#}", path.display(), e),
+        }
+    }
+    println!(
+        "done: {}/{} ok in {:.1}s wall ({:.2} files/s)",
+        ok,
+        outcomes.len(),
+        total,
+        outcomes.len() as f64 / total
+    );
+    if ok < outcomes.len() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn list_edfs(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut v = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let p = entry?.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with(".edf") || name.ends_with(".edf.gz") || name.ends_with(".edf.zst") {
+            v.push(p);
+        }
+    }
+    v.sort();
+    Ok(v)
+}
+
+fn out_path_for(input: &Path, out_dir: &Path, rate: f64, c: Compress) -> PathBuf {
+    out_dir.join(default_output_path(input, rate, c).file_name().unwrap())
+}
+
+fn default_output_path(input: &Path, rate: f64, c: Compress) -> PathBuf {
+    let stem = input
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("out")
+        .trim_end_matches(".zst")
+        .trim_end_matches(".gz")
+        .trim_end_matches(".edf");
+    let ext = match c {
+        Compress::None => "edf",
+        Compress::Gzip => "edf.gz",
+        Compress::Zstd => "edf.zst",
+    };
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{}_{}Hz.{}", stem, rate as i64, ext))
+}
+
+fn convert_one(input: &Path, output: &Path, args: &Args) -> Result<()> {
+    if args.verbose {
+        eprintln!("opening {}", input.display());
+    }
+    let (mut hdr, data_i16) = edf::read_edf_path(input)?;
+    if args.verbose {
+        eprintln!(
+            "  header: {} signals, {} records x {}s",
+            hdr.num_signals, hdr.num_data_records, hdr.data_record_duration
+        );
+        for (i, s) in hdr.signals.iter().enumerate() {
+            eprintln!(
+                "  ch[{}] '{}' spr={} digital=[{},{}] phys=[{},{}]",
+                i,
+                s.label.trim(),
+                s.samples_per_record,
+                s.digital_min,
+                s.digital_max,
+                s.physical_min,
+                s.physical_max
+            );
+        }
+    }
+    if hdr.num_data_records < 0 {
+        bail!("could not infer num_data_records from file (still -1 after read)");
+    }
+
+    let target_rate = args.target_rate;
+    let record_duration = hdr.data_record_duration;
+
+    // For each non-annotation signal: physical decode -> resample -> int16 quantize.
+    let new_data: Vec<Vec<i16>> = (0..hdr.signals.len())
+        .map(|si| {
+            let s = &hdr.signals[si];
+            if s.is_annotations() {
+                // Pass through verbatim.
+                return Ok::<Vec<i16>, anyhow::Error>(data_i16[si].clone());
+            }
+            let orig_rate = s.sampling_frequency(record_duration);
+            let scale = s.scale() as f32;
+            let offset = s.offset() as f32;
+            let xphys: Vec<f32> = data_i16[si]
+                .iter()
+                .map(|&v| (v as f32) * scale + offset)
+                .collect();
+
+            let yphys = if (orig_rate - target_rate).abs() < 1e-9 {
+                xphys
+            } else {
+                resample::resample_channel(&xphys, orig_rate, target_rate)?
+            };
+            Ok(yphys
+                .iter()
+                .copied()
+                .collect::<Vec<f32>>()
+                .iter()
+                .map(|v| *v) // placeholder; real quantize below
+                .collect::<Vec<f32>>()
+                .iter()
+                .map(|_| 0i16)
+                .collect()) // dummy; replaced below
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // The closure above can't mutate the header (we need to rewrite
+    // physical_min/max under recompute and samples_per_record under any rate
+    // change), so do the f32 -> i16 conversion + header update here in a
+    // second pass.
+    let new_data = quantize_and_update_header(&mut hdr, target_rate, record_duration, &data_i16, &new_data, args.auto_scale)?;
+
+    write_output(output, &hdr, &new_data, args)
+}
+
+fn quantize_and_update_header(
+    hdr: &mut edf::Header,
+    target_rate: f64,
+    record_duration: f64,
+    orig_data_i16: &[Vec<i16>],
+    _placeholder: &[Vec<i16>],
+    auto_scale: AutoScale,
+) -> Result<Vec<Vec<i16>>> {
+    // Re-do the resample here so we have f32 to quantize correctly. (The
+    // first-pass closure above couldn't return both f32 and i16 cleanly, and
+    // duplicating work is acceptable for now -- this is a draft pipeline,
+    // not a perf-tuned one. We'll fold the two passes together once correctness
+    // is verified.)
+    let new_spr_f = target_rate * record_duration;
+    if (new_spr_f - new_spr_f.round()).abs() > 1e-9 {
+        bail!(
+            "target_rate * data_record_duration = {} not integer",
+            new_spr_f
+        );
+    }
+    let new_spr = new_spr_f.round() as u32;
+
+    let mut new_signals = Vec::with_capacity(hdr.signals.len());
+    let mut new_data = Vec::with_capacity(hdr.signals.len());
+    let mut min_records = i64::MAX;
+    for (si, sig) in hdr.signals.iter().enumerate() {
+        if sig.is_annotations() {
+            new_signals.push(sig.clone());
+            new_data.push(orig_data_i16[si].clone());
+            continue;
+        }
+        let orig_rate = sig.sampling_frequency(record_duration);
+        let scale = sig.scale() as f32;
+        let offset = sig.offset() as f32;
+        let xphys: Vec<f32> = orig_data_i16[si]
+            .iter()
+            .map(|&v| (v as f32) * scale + offset)
+            .collect();
+
+        let yphys = if (orig_rate - target_rate).abs() < 1e-9 {
+            xphys
+        } else {
+            resample::resample_channel(&xphys, orig_rate, target_rate)?
+        };
+
+        // Trim to integer multiple of new_spr
+        let nrec = (yphys.len() / new_spr as usize) as i64;
+        if nrec < 1 {
+            bail!("signal '{}' has no full records after resample", sig.label.trim());
+        }
+        if nrec < min_records {
+            min_records = nrec;
+        }
+        let len = nrec as usize * new_spr as usize;
+        let yphys = &yphys[..len];
+
+        // Determine physical_min/max for quantization
+        let (pmin, pmax) = match auto_scale {
+            AutoScale::Preserve => (sig.physical_min, sig.physical_max),
+            AutoScale::Recompute => {
+                let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                for &v in yphys {
+                    if v < lo {
+                        lo = v;
+                    }
+                    if v > hi {
+                        hi = v;
+                    }
+                }
+                if !lo.is_finite() || !hi.is_finite() || (hi - lo) < 1e-30 {
+                    (sig.physical_min, sig.physical_max)
+                } else {
+                    (lo as f64, hi as f64)
+                }
+            }
+        };
+
+        let dmin: i32 = -32768;
+        let dmax: i32 = 32767;
+        let new_scale = (pmax - pmin) / (dmax - dmin) as f64;
+        let new_offset = pmin - new_scale * dmin as f64;
+        let new_scale = if new_scale == 0.0 { 1.0 } else { new_scale };
+        let new_data_sig: Vec<i16> = yphys
+            .iter()
+            .map(|&v| {
+                let q = ((v as f64 - new_offset) / new_scale).round();
+                q.clamp(dmin as f64, dmax as f64) as i16
+            })
+            .collect();
+
+        let mut new_sig = sig.clone();
+        new_sig.physical_min = pmin;
+        new_sig.physical_max = pmax;
+        new_sig.digital_min = dmin;
+        new_sig.digital_max = dmax;
+        new_sig.samples_per_record = new_spr;
+        new_signals.push(new_sig);
+        new_data.push(new_data_sig);
+    }
+
+    if min_records == i64::MAX {
+        // No non-annotation signals (unusual). Keep original record count.
+        min_records = hdr.num_data_records;
+    }
+
+    hdr.signals = new_signals;
+    hdr.num_data_records = min_records;
+    Ok(new_data)
+}
+
+fn write_output(path: &Path, hdr: &edf::Header, data: &[Vec<i16>], args: &Args) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let f = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut writer: Box<dyn Write> = match args.compress {
+        Compress::None => Box::new(std::io::BufWriter::new(f)),
+        Compress::Gzip => Box::new(flate2::write::GzEncoder::new(f, flate2::Compression::new(args.gzip_level))),
+        Compress::Zstd => {
+            let mut enc = zstd::stream::write::Encoder::new(f, args.zstd_level)?;
+            enc.multithread(num_cpus().max(1) as u32).ok();
+            Box::new(enc.auto_finish())
+        }
+    };
+    edf::write_header(&mut writer, hdr)?;
+    edf::write_data(&mut writer, hdr, data)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
