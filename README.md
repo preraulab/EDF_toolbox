@@ -24,11 +24,19 @@ convert_EDF('sleep.edf', 128);
 result = batch_convert_EDF('/path/to/edfs', 128, 'OutputDir', '/path/out');
 ```
 
-From the shell:
+From the shell (calls MATLAB):
 
 ```sh
-bin/convert_edf -r 128 -o /path/out /path/to/edfs       # zstd by default
-bin/convert_edf -r 128 --compress-mode gzip --gzip-level 1 /path/to/edfs
+bin/convert_edf -r 128 -o /path/out /path/to/edfs                # zstd-9 by default
+bin/convert_edf -r 128 --compress-mode gzip --gzip-level 9 /path/to/edfs
+```
+
+For one-shot batch conversion of many files, the **standalone Rust binary** is ~3× faster and has no MATLAB dependency:
+
+```sh
+cd rust && cargo build --release
+./target/release/convert_edf --batch /path/to/edfs -r 100 --out /path/out
+# default output: .edf.gz (gzip-9, parallel, all cores)
 ```
 
 - `header` — struct with main-header metadata (patient ID, record duration, start date/time, etc.)
@@ -247,6 +255,52 @@ bin/convert_edf -r 128 --compress-mode none --no-parallel /path/file.edf
 
 The CLI shells out to MATLAB once per invocation — startup cost (~10 s) is amortized across the whole batch, which is why a single `convert_edf` call across many files is much faster than scripting per-file invocations.
 
+### Rust binary — fastest path for big batches
+
+For one-shot conversion of hundreds–thousands of files, the standalone Rust binary at `rust/` is **~3× faster** than the MATLAB pipeline and has no MATLAB dependency. It uses `rubato`'s FFT resampler, parallel-gzip via `gzp`, and per-file `rayon` parallelism.
+
+```sh
+cd rust
+cargo build --release
+# binary at rust/target/release/convert_edf
+# (on macOS with MacPorts: prepend AR=/usr/bin/ar RANLIB=/usr/bin/ranlib)
+```
+
+Defaults — `--compress gzip --gzip-level 9`, `--auto-scale recompute`, `--jobs 0` (= all cores) — are tuned for typical PSG batches. The headline form is just:
+
+```sh
+# Convert a whole directory of EDFs to 100 Hz, parallel, gzip-9 output
+./convert_edf --batch /data/edfs_in -r 100 --out /data/edfs_out
+# writes <basename>_100Hz.edf.gz next to each input under --out
+```
+
+Common variants:
+
+```sh
+# Single file
+./convert_edf input.edf -r 100 -o output.edf.gz
+./convert_edf input.edf.zst -r 100 -o output.edf.gz   # auto-detects input format
+
+# Force zstd output (faster decode, slightly bigger than gzip-9, slower to write)
+./convert_edf --batch /in -r 100 --out /out --compress zstd --zstd-level 3
+
+# Pure resample, no compression (fastest write, biggest output)
+./convert_edf --batch /in -r 100 --out /out --compress none
+
+# Maximum compression for write-once archives (much slower, ~10 % smaller)
+./convert_edf --batch /in -r 100 --out /out --compress zstd --zstd-level 19
+
+# Limit parallelism (e.g. on a shared box)
+./convert_edf --batch /in -r 100 --out /out --jobs 8
+
+# Verbose progress
+./convert_edf --batch /in -r 100 --out /out -v
+```
+
+The `--compress` flag and the output extension are independent: `-o foo.edf.gz` always wins. In `--batch` mode the codec flag drives the extension on every output.
+
+The Rust binary defaults to gzip-9 while MATLAB defaults to zstd-9 because MATLAB's gzip path is single-threaded; the parallel-gzip win in `gzp` does not transfer there. On a 24-core box the Rust pipeline finishes a 10-file batch in ~11 s vs ~38 s for MATLAB.
+
 ### Inspect the header in a GUI
 
 ```matlab
@@ -323,14 +377,12 @@ Typical speedup for a full-night PSG file: 5-20× over the pure-MATLAB path, dep
 
 ### gzip vs zstd
 
-zstd at level 9 is the default for `convert_EDF`. On real EDF data:
+The two pipelines have different defaults for a real reason:
 
-- zstd-9 is **~2× faster** to compress than gzip-6 with **~20 % smaller** output.
-- Decompression is fast for both codecs — the absolute overhead per file is tens of ms either way, so total read time differs by only a few percent. Read time is essentially codec-independent; pick zstd for the write-side and size wins.
-- zstd decompression is also roughly level-independent, so picking a stronger zstd level (9 vs 3) costs nothing on read.
-- zstd-9 is ~9 % smaller than zstd-3 for ~50 % extra compress wall — the right tradeoff for archival writes that get read many times.
+- **Rust binary: `gzip-9`.** With the parallel-gzip encoder (`gzp` crate), gzip-9 produces output ~1 % bigger than zstd-9 in roughly half the wall time, on both 24-core Linux and Apple Silicon — pareto-optimal for write speed and size.
+- **MATLAB: `zstd-9`.** MATLAB's gzip path shells out to single-threaded system `gzip`, so the parallel-gzip win does not transfer; libzstd's MEX path is multithreaded and ends up faster than single-threaded gzip on multi-core boxes.
 
-Use `.edf.gz` only when handing files to a tool that does not understand `.zst`. All three modes produce bit-identical decoded signals.
+Read-side overhead is small for both codecs (tens of ms per file). gzip adds ~80 ms/file, zstd adds ~20 ms/file — a few percent of total read time either way. Pick `--compress zstd --zstd-level 3` if read speed is paramount; pick `--compress zstd --zstd-level 19` for write-once archives where every byte of output matters. All modes produce bit-identical decoded signals.
 
 ### Pure-MATLAB fallback
 

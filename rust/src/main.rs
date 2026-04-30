@@ -1,7 +1,7 @@
 //! convert_edf -- standalone EDF resample / rewrite tool.
 //!
 //! Usage:
-//!   convert_edf input.edf -r 100 -o output.edf.zst
+//!   convert_edf input.edf -r 100 -o output.edf.gz
 //!   convert_edf --batch /path/to/edfs -r 100 --jobs 4 --out-dir /path/to/out
 //!
 //! Pipeline per file:
@@ -60,19 +60,23 @@ struct Args {
     #[arg(short = 'o', long)]
     out: Option<PathBuf>,
 
-    /// Compression for output. Default: zstd.
-    #[arg(long, value_enum, default_value_t = Compress::Zstd)]
+    /// Compression for output. Default: gzip. With the gzp parallel-gzip
+    /// encoder, gzip-9 is pareto-optimal in this pipeline -- nearly the same
+    /// output size as zstd-9 (within ~1%) at roughly half the wall time.
+    /// Pick zstd if you specifically want faster decode (gzip adds ~80 ms/file
+    /// vs zstd's ~20 ms/file -- small in absolute terms either way).
+    #[arg(long, value_enum, default_value_t = Compress::Gzip)]
     compress: Compress,
 
-    /// Zstd compression level (1-22). Default 9 -- best size/speed tradeoff
-    /// for typical EDF archival on multi-core boxes (~9% smaller than zstd-3
-    /// for ~50% extra wall; read time is unchanged since zstd decompression
-    /// is roughly level-independent).
-    #[arg(long, default_value_t = 9)]
+    /// Zstd compression level (1-22). zstd-3 is fast and a reasonable
+    /// alternative to gzip-9 for decode-speed-sensitive use; zstd-19+ is for
+    /// archival (smaller, much slower to compress).
+    #[arg(long, default_value_t = 3)]
     zstd_level: i32,
 
-    /// Gzip compression level (1-9).
-    #[arg(long, default_value_t = 6)]
+    /// Gzip compression level (1-9). Default 9: smallest output of the fast
+    /// codec tier in the parallel-gzip path.
+    #[arg(long, default_value_t = 9)]
     gzip_level: u32,
 
     /// Auto-rescale physical_min/max to fit resampled data range.
