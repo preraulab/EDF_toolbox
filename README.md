@@ -266,38 +266,54 @@ cargo build --release
 # (on macOS with MacPorts: prepend AR=/usr/bin/ar RANLIB=/usr/bin/ranlib)
 ```
 
-Defaults — `--compress gzip --gzip-level 9`, `--auto-scale recompute`, `--jobs 0` (= all cores) — are tuned for typical PSG batches. The headline form is just:
+Defaults — `--compress gzip --gzip-level 9`, `--auto-scale recompute`, `--jobs 0` (= all cores) — are tuned for typical PSG batches. The CLI takes one or more positional inputs that may be files or directories, mixed:
 
 ```sh
-# Convert a whole directory of EDFs to 100 Hz, parallel, gzip-9 output
-./convert_edf --batch /data/edfs_in -r 100 --out /data/edfs_out
-# writes <basename>_100Hz.edf.gz next to each input under --out
+# A single file
+./convert_edf -r 100 -o output.edf.gz input.edf
+
+# A whole directory (top-level only)
+./convert_edf -r 100 --out /data/edfs_out /data/edfs_in
+
+# A directory tree, recursively (mirrors source structure under --out)
+./convert_edf -r 100 --out /data/edfs_out -R /data/study_root
+
+# Several specific files
+./convert_edf -r 100 --out /data/edfs_out a.edf b.edf c.edf
+
+# Mix of files and directories in one shot
+./convert_edf -r 100 --out /data/edfs_out -R one.edf /data/edfs_in /data/more
 ```
 
-Common variants:
+Recursive output is mirrored into `--out` by default — e.g. `/in/sub/foo.edf` becomes `/out/sub/foo_100Hz.edf.gz`. Pass `--flatten` to drop everything at the top of `--out`:
 
 ```sh
-# Single file
-./convert_edf input.edf -r 100 -o output.edf.gz
-./convert_edf input.edf.zst -r 100 -o output.edf.gz   # auto-detects input format
+./convert_edf -r 100 --out /flat -R --flatten /data/study_root
+```
 
+Codec, parallelism, and verbosity work the same regardless of input shape:
+
+```sh
 # Force zstd output (faster decode, slightly bigger than gzip-9, slower to write)
-./convert_edf --batch /in -r 100 --out /out --compress zstd --zstd-level 3
+./convert_edf -r 100 --out /out --compress zstd --zstd-level 3 -R /in
 
 # Pure resample, no compression (fastest write, biggest output)
-./convert_edf --batch /in -r 100 --out /out --compress none
+./convert_edf -r 100 --out /out --compress none /in
 
 # Maximum compression for write-once archives (much slower, ~10 % smaller)
-./convert_edf --batch /in -r 100 --out /out --compress zstd --zstd-level 19
+./convert_edf -r 100 --out /out --compress zstd --zstd-level 19 -R /in
 
 # Limit parallelism (e.g. on a shared box)
-./convert_edf --batch /in -r 100 --out /out --jobs 8
+./convert_edf -r 100 --out /out --jobs 8 /in
 
 # Verbose progress
-./convert_edf --batch /in -r 100 --out /out -v
+./convert_edf -r 100 --out /out -v /in
 ```
 
-The `--compress` flag and the output extension are independent: `-o foo.edf.gz` always wins. In `--batch` mode the codec flag drives the extension on every output.
+Notes:
+- Output paths and extensions: `-o FILE` (single-file mode) always wins regardless of `--compress`. In multi-file mode `-o` must be a directory and the codec flag drives the extension on every output.
+- Hidden files and directories (names starting with `.`) are skipped — no surprise pickups of `.DS_Store`, `.git`, etc.
+- The legacy `--batch DIR` flag is still accepted but undocumented; new code should pass the directory positionally.
 
 The Rust binary defaults to gzip-9 while MATLAB defaults to zstd-9 because MATLAB's gzip path is single-threaded; the parallel-gzip win in `gzp` does not transfer there. On a 24-core box the Rust pipeline finishes a 10-file batch in ~11 s vs ~38 s for MATLAB.
 

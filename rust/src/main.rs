@@ -2,7 +2,13 @@
 //!
 //! Usage:
 //!   convert_edf input.edf -r 100 -o output.edf.gz
-//!   convert_edf --batch /path/to/edfs -r 100 --jobs 4 --out-dir /path/to/out
+//!   convert_edf -r 100 -o /path/to/out /path/to/edfs
+//!   convert_edf -r 100 -o /path/to/out -R /path/to/study_root
+//!   convert_edf -r 100 -o /path/to/out a.edf b.edf c.edf
+//!
+//! Positional arguments may be files or directories, mixed. Pass `-R` to
+//! recurse into subdirectories. Output structure mirrors the source tree
+//! by default; pass `--flatten` to drop all outputs at the top of `--out`.
 //!
 //! Pipeline per file:
 //!   read EDF (auto-detect .edf / .edf.gz / .edf.zst)
@@ -40,12 +46,23 @@ enum AutoScale {
 #[derive(Parser, Debug)]
 #[command(version, about = "Resample and rewrite EDF files")]
 struct Args {
-    /// Input file. Mutually exclusive with --batch.
-    input: Option<PathBuf>,
+    /// Input files or directories (mixable). Directories are scanned for
+    /// .edf / .edf.gz / .edf.zst; pass -R to recurse.
+    inputs: Vec<PathBuf>,
 
-    /// Batch mode: process every *.edf / *.edf.gz / *.edf.zst under this dir.
-    #[arg(long)]
+    /// Backward-compat alias for passing a single directory positionally.
+    /// Prefer the positional form: `convert_edf -r 100 --out OUT /path/to/dir`.
+    #[arg(long, hide = true)]
     batch: Option<PathBuf>,
+
+    /// Recurse into subdirectories of any directory inputs.
+    #[arg(short = 'R', long)]
+    recursive: bool,
+
+    /// In recursive mode, write all outputs flat in --out instead of
+    /// mirroring the source directory tree. Ignored if not recursive.
+    #[arg(long)]
+    flatten: bool,
 
     /// Target sampling rate (Hz). Required unless --read-bench is set.
     #[arg(short = 'r', long, default_value_t = 0.0)]
@@ -56,7 +73,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     read_bench: bool,
 
-    /// Output file (single-input mode) or output directory (batch mode).
+    /// Output file (single-file input only) or output directory (multi-file
+    /// or directory inputs). When mirroring directory structure, this is the
+    /// root under which the source tree is reproduced.
     #[arg(short = 'o', long)]
     out: Option<PathBuf>,
 
@@ -94,8 +113,14 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    if args.input.is_none() == args.batch.is_none() {
-        bail!("specify either INPUT or --batch DIR (exactly one)");
+
+    // Merge positional inputs and the legacy --batch alias.
+    let mut roots: Vec<PathBuf> = args.inputs.clone();
+    if let Some(b) = &args.batch {
+        roots.push(b.clone());
+    }
+    if roots.is_empty() {
+        bail!("no inputs given (pass FILE..., DIR..., or --batch DIR)");
     }
     if !args.read_bench && args.target_rate <= 0.0 {
         bail!("--target-rate / -r is required (or pass --read-bench to skip conversion)");
@@ -108,41 +133,78 @@ fn main() -> Result<()> {
             .ok();
     }
 
+    // Collect (top_root, file_path) so we can mirror the source tree.
+    // top_root is the user-supplied path under which file_path was found;
+    // for a single file argument, top_root is the file's parent directory.
+    let pairs = collect_inputs(&roots, args.recursive)?;
+
     if args.read_bench {
-        return run_read_bench(&args);
+        return run_read_bench_pairs(&pairs);
     }
 
-    if let Some(input) = &args.input {
-        let out = args
-            .out
-            .clone()
-            .unwrap_or_else(|| default_output_path(input, args.target_rate, args.compress));
-        let t0 = Instant::now();
-        convert_one(input, &out, &args)?;
-        if args.verbose {
-            println!("{} -> {} in {:.2}s", input.display(), out.display(), t0.elapsed().as_secs_f64());
+    if pairs.is_empty() {
+        bail!("no .edf / .edf.gz / .edf.zst files found");
+    }
+
+    // Single-file shortcut: exactly one input file, --out points at a file
+    // (not a directory). Preserve the historical "give me one file out"
+    // ergonomic.
+    if pairs.len() == 1 {
+        if let Some(out) = &args.out {
+            let is_dir = out.is_dir() || roots.iter().any(|r| r.is_dir());
+            if !is_dir {
+                let (_root, input) = &pairs[0];
+                let t0 = Instant::now();
+                convert_one(input, out, &args)?;
+                if args.verbose {
+                    println!("{} -> {} in {:.2}s", input.display(), out.display(),
+                             t0.elapsed().as_secs_f64());
+                }
+                return Ok(());
+            }
+        } else {
+            // No --out and one file: write next to the input.
+            let (_root, input) = &pairs[0];
+            let out = default_output_path(input, args.target_rate, args.compress);
+            let t0 = Instant::now();
+            convert_one(input, &out, &args)?;
+            if args.verbose {
+                println!("{} -> {} in {:.2}s", input.display(), out.display(),
+                         t0.elapsed().as_secs_f64());
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
-    let in_dir = args.batch.as_ref().unwrap();
+    // Multi-file / directory mode. --out must be a directory.
     let out_dir = args
         .out
         .clone()
-        .ok_or_else(|| anyhow!("--out DIR is required in batch mode"))?;
+        .ok_or_else(|| anyhow!("--out DIR is required when converting multiple files or a directory"))?;
+    if out_dir.is_file() {
+        bail!(
+            "--out points at a regular file ({}) but {} inputs were given; \
+             pass a directory in multi-file mode",
+            out_dir.display(),
+            pairs.len()
+        );
+    }
     std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
-    let inputs = list_edfs(in_dir)?;
-    if inputs.is_empty() {
-        bail!("no EDFs found under {}", in_dir.display());
-    }
-    println!("convert_edf: {} files, target {} Hz", inputs.len(), args.target_rate);
+    println!("convert_edf: {} files, target {} Hz", pairs.len(), args.target_rate);
 
     let t0 = Instant::now();
-    let outcomes: Vec<(PathBuf, Result<f64>)> = inputs
+    let outcomes: Vec<(PathBuf, Result<f64>)> = pairs
         .par_iter()
-        .map(|input| {
-            let out = out_path_for(input, &out_dir, args.target_rate, args.compress);
+        .map(|(root, input)| {
+            let out = mirror_out_path(root, input, &out_dir, args.target_rate, args.compress, args.flatten);
+            // Ensure parent dir of `out` exists (mirrored subdirs).
+            if let Some(parent) = out.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return (input.clone(),
+                        Err(anyhow!("creating {}: {}", parent.display(), e)));
+                }
+            }
             let t1 = Instant::now();
             match convert_one(input, &out, &args) {
                 Ok(()) => (input.clone(), Ok(t1.elapsed().as_secs_f64())),
@@ -181,12 +243,8 @@ fn main() -> Result<()> {
 /// loading all int16 samples into memory and dropping them. Prints total
 /// wall time and aggregate throughput. Used to measure how compression
 /// affects read speed end-to-end.
-fn run_read_bench(args: &Args) -> Result<()> {
-    let inputs: Vec<PathBuf> = if let Some(input) = &args.input {
-        vec![input.clone()]
-    } else {
-        list_edfs(args.batch.as_ref().unwrap())?
-    };
+fn run_read_bench_pairs(pairs: &[(PathBuf, PathBuf)]) -> Result<()> {
+    let inputs: Vec<PathBuf> = pairs.iter().map(|(_, f)| f.clone()).collect();
     if inputs.is_empty() {
         bail!("no inputs to read-bench");
     }
@@ -230,24 +288,90 @@ fn run_read_bench(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn list_edfs(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut v = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let p = entry?.path();
-        if !p.is_file() {
-            continue;
-        }
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.ends_with(".edf") || name.ends_with(".edf.gz") || name.ends_with(".edf.zst") {
-            v.push(p);
-        }
-    }
-    v.sort();
-    Ok(v)
+/// True if the filename has an EDF extension we know about.
+fn is_edf_filename(name: &str) -> bool {
+    name.ends_with(".edf") || name.ends_with(".edf.gz") || name.ends_with(".edf.zst")
 }
 
-fn out_path_for(input: &Path, out_dir: &Path, rate: f64, c: Compress) -> PathBuf {
-    out_dir.join(default_output_path(input, rate, c).file_name().unwrap())
+/// Resolve user-supplied root paths into a list of (root, file) pairs.
+/// `root` is the original positional argument under which `file` was
+/// discovered; for a file argument the root is the file's parent directory
+/// (so the relative-path-from-root is just the basename).
+fn collect_inputs(roots: &[PathBuf], recursive: bool) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut out = Vec::new();
+    for root in roots {
+        if !root.exists() {
+            bail!("input not found: {}", root.display());
+        }
+        if root.is_file() {
+            let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !is_edf_filename(name) {
+                bail!("not an EDF file: {}", root.display());
+            }
+            let parent = root.parent().unwrap_or_else(|| Path::new("."));
+            out.push((parent.to_path_buf(), root.clone()));
+        } else if root.is_dir() {
+            walk_dir(root, root, recursive, &mut out)?;
+        } else {
+            bail!("input is not a regular file or directory: {}", root.display());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Recursive (or single-level) directory walker. Skips hidden entries
+/// (names starting with '.') so we don't pick up macOS .DS_Store, .git,
+/// etc. by accident.
+fn walk_dir(
+    root: &Path,
+    dir: &Path,
+    recursive: bool,
+    out: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let entry = entry?;
+        let p = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') {
+            continue;
+        }
+        let ft = entry.file_type()?;
+        if ft.is_file() {
+            if is_edf_filename(&name_str) {
+                out.push((root.to_path_buf(), p));
+            }
+        } else if ft.is_dir() && recursive {
+            walk_dir(root, &p, recursive, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Compute the output path for a discovered file.
+/// - flatten: drop the source-tree path; place the renamed file directly
+///   under `out_dir` (named like default_output_path's basename).
+/// - mirror (default): replicate the path of `input` relative to `root`
+///   under `out_dir`, then rename the leaf file.
+fn mirror_out_path(
+    root: &Path,
+    input: &Path,
+    out_dir: &Path,
+    rate: f64,
+    c: Compress,
+    flatten: bool,
+) -> PathBuf {
+    let renamed = default_output_path(input, rate, c)
+        .file_name()
+        .map(|n| n.to_owned())
+        .unwrap_or_default();
+    if flatten {
+        return out_dir.join(renamed);
+    }
+    let rel = input.strip_prefix(root).unwrap_or(input);
+    let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
+    out_dir.join(parent_rel).join(renamed)
 }
 
 fn default_output_path(input: &Path, rate: f64, c: Compress) -> PathBuf {
