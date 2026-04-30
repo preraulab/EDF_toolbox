@@ -95,26 +95,49 @@ check_accuracy() {
 }
 
 results_file=$(mktemp)
-printf "%-15s %10s %12s %10s %10s %12s\n" "codec" "wall_s" "out_bytes" "out_size" "ratio_in" "accuracy" | tee "$results_file"
+printf "%-15s %8s %8s %10s %10s %12s\n" "codec" "write_s" "read_s" "out_size" "ratio_in" "accuracy" | tee "$results_file"
+
+# Drop OS page cache before each read benchmark so we measure real disk +
+# decompress cost, not RAM. Requires sudo; falls back silently if not allowed.
+DROP_CACHES_OK=1
+if ! sudo -n true 2>/dev/null; then
+    DROP_CACHES_OK=0
+    echo "(note: sudo not available, read times include page cache hits)"
+fi
+drop_caches() {
+    if [ "$DROP_CACHES_OK" -eq 1 ]; then
+        sudo -n sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
+    fi
+}
 
 run_one() {
     local label="$1"; shift
     rm -rf "$OUT_DIR" && mkdir -p "$OUT_DIR"
-    local t0 t1 wall out_bytes out_human ratio accuracy
+    local t0 t1 wall out_bytes out_human ratio accuracy read_s
     t0=$(date +%s.%N)
     "$BIN" --batch "$INDIR" -r 100 --out "$OUT_DIR" --jobs 0 "$@" >/dev/null 2>&1
     local rc=$?
     t1=$(date +%s.%N)
     wall=$(awk -v a="$t1" -v b="$t0" 'BEGIN{printf "%.2f", a-b}')
     if [ "$rc" -ne 0 ]; then
-        printf "%-15s %10s %12s %10s %10s %12s\n" "$label" "$wall" "FAIL" "-" "-" "-" | tee -a "$results_file"
+        printf "%-15s %8s %8s %10s %10s %12s\n" "$label" "$wall" "-" "FAIL" "-" "-" | tee -a "$results_file"
         return
     fi
     out_bytes=$(du -sb "$OUT_DIR" | awk '{print $1}')
     out_human=$(du -sh "$OUT_DIR" | awk '{print $1}')
     ratio=$(awk -v out="$out_bytes" -v in_b="$in_bytes" 'BEGIN{ if(in_b>0) printf "%.3f", out/in_b; else print "-"}')
     accuracy=$(check_accuracy)
-    printf "%-15s %10s %12s %10s %10s %12s\n" "$label" "$wall" "$out_bytes" "$out_human" "$ratio" "$accuracy" | tee -a "$results_file"
+
+    # Measure read speed: drop caches, then time a parallel read of every
+    # output file via the rust binary's --read-bench mode.
+    drop_caches
+    local rt0 rt1
+    rt0=$(date +%s.%N)
+    "$BIN" --batch "$OUT_DIR" --read-bench --jobs 0 >/dev/null 2>&1
+    rt1=$(date +%s.%N)
+    read_s=$(awk -v a="$rt1" -v b="$rt0" 'BEGIN{printf "%.2f", a-b}')
+
+    printf "%-15s %8s %8s %10s %10s %12s\n" "$label" "$wall" "$read_s" "$out_human" "$ratio" "$accuracy" | tee -a "$results_file"
 }
 
 echo

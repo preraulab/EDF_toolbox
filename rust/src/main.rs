@@ -47,9 +47,14 @@ struct Args {
     #[arg(long)]
     batch: Option<PathBuf>,
 
-    /// Target sampling rate (Hz).
-    #[arg(short = 'r', long)]
+    /// Target sampling rate (Hz). Required unless --read-bench is set.
+    #[arg(short = 'r', long, default_value_t = 0.0)]
     target_rate: f64,
+
+    /// Read-only benchmark: read every input EDF (decompressing as needed)
+    /// and print the elapsed wall time. No output is written.
+    #[arg(long, default_value_t = false)]
+    read_bench: bool,
 
     /// Output file (single-input mode) or output directory (batch mode).
     #[arg(short = 'o', long)]
@@ -85,12 +90,19 @@ fn main() -> Result<()> {
     if args.input.is_none() == args.batch.is_none() {
         bail!("specify either INPUT or --batch DIR (exactly one)");
     }
+    if !args.read_bench && args.target_rate <= 0.0 {
+        bail!("--target-rate / -r is required (or pass --read-bench to skip conversion)");
+    }
 
     if args.jobs > 0 {
         rayon::ThreadPoolBuilder::new()
             .num_threads(args.jobs)
             .build_global()
             .ok();
+    }
+
+    if args.read_bench {
+        return run_read_bench(&args);
     }
 
     if let Some(input) = &args.input {
@@ -155,6 +167,59 @@ fn main() -> Result<()> {
     if ok < outcomes.len() {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// Read every input EDF in parallel (rayon), decompressing as needed,
+/// loading all int16 samples into memory and dropping them. Prints total
+/// wall time and aggregate throughput. Used to measure how compression
+/// affects read speed end-to-end.
+fn run_read_bench(args: &Args) -> Result<()> {
+    let inputs: Vec<PathBuf> = if let Some(input) = &args.input {
+        vec![input.clone()]
+    } else {
+        list_edfs(args.batch.as_ref().unwrap())?
+    };
+    if inputs.is_empty() {
+        bail!("no inputs to read-bench");
+    }
+    let total_input_bytes: u64 = inputs
+        .iter()
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum();
+
+    let t0 = Instant::now();
+    let outcomes: Vec<Result<usize>> = inputs
+        .par_iter()
+        .map(|p| {
+            let (hdr, data) = edf::read_edf_path(p)?;
+            // Touch every sample so the optimizer can't elide the read.
+            let mut total = 0usize;
+            for ch in &data {
+                total += ch.len();
+            }
+            // Use hdr to make sure parsing happened
+            let _ = hdr.num_signals;
+            Ok(total)
+        })
+        .collect();
+    let wall = t0.elapsed().as_secs_f64();
+
+    let mut ok = 0usize;
+    for r in &outcomes {
+        if r.is_ok() {
+            ok += 1;
+        }
+    }
+    let mb_per_s = (total_input_bytes as f64) / (1024.0 * 1024.0) / wall;
+    println!(
+        "read-bench: {}/{} files in {:.2}s ({} bytes, {:.1} MB/s on-disk input)",
+        ok,
+        inputs.len(),
+        wall,
+        total_input_bytes,
+        mb_per_s
+    );
     Ok(())
 }
 
