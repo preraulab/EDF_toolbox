@@ -30,13 +30,6 @@ function out_path = convert_EDF(in_fname, target_rate, varargin)
 %                        physical_min/max to the actual data range so the
 %                        anti-aliasing filter's ringing isn't clipped at
 %                        the source file's narrower stored range.
-%       'MaxResampleBlockMB' : 4096 (default). Cap on the size of any
-%                        single resample() matrix call. Channels of the
-%                        same source rate and length are grouped and
-%                        resampled together (one matrix call instead of
-%                        N per-channel calls); this cap chunks the group
-%                        if the stacked matrix would exceed the budget.
-%                        Lower it on memory-constrained machines.
 %
 %   Output:
 %       out_path : full path of the written file
@@ -71,7 +64,6 @@ addParameter(p, 'GzipLevel',    6, @(x) isnumeric(x) && isscalar(x) && x >= 1 &&
 addParameter(p, 'ZstdLevel',    3, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
 addParameter(p, 'Verbose',      false, @islogical);
 addParameter(p, 'AutoScale',    'recompute', @(s) any(strcmpi(s, {'preserve','recompute'})));
-addParameter(p, 'MaxResampleBlockMB', 4096, @(x) isnumeric(x) && isscalar(x) && x > 0);
 parse(p, in_fname, target_rate, varargin{:});
 
 in_fname     = char(p.Results.in_fname);
@@ -83,7 +75,6 @@ gzip_level   = double(p.Results.GzipLevel);
 zstd_level   = double(p.Results.ZstdLevel);
 verbose      = p.Results.Verbose;
 autoscale    = p.Results.AutoScale;
-max_block_bytes = double(p.Results.MaxResampleBlockMB) * 1024 * 1024;
 
 % Resolve compression mode. CompressMode wins; otherwise legacy Compress flag.
 if isempty(compress_mode)
@@ -151,87 +142,53 @@ end
 new_signal_cell = signal_cell;
 new_signal_header = signal_header;
 
-% --- Group channels by (orig_rate, length) ---------------------------------
-% Channels of the same source rate AND same length can be stacked into a
-% single matrix and resampled with one resample() call (column-wise),
-% avoiding per-channel function-call overhead and giving MATLAB's IPP /
-% BLAS path a larger contiguous workload to dispatch on.
-group_map = containers.Map('KeyType','char','ValueType','any');
 for i = 1:n_signals
     if i == annot_idx, continue; end
+
     orig_rate = signal_header(i).sampling_frequency;
     if isempty(orig_rate) || ~isfinite(orig_rate) || orig_rate <= 0
         orig_rate = signal_header(i).samples_in_record / record_duration;
     end
-    if abs(orig_rate - target_rate) < 1e-9, continue; end  % already at target
-    L = numel(signal_cell{i});
-    gkey = sprintf('%.10g_%d', orig_rate, L);
-    if isKey(group_map, gkey)
-        g = group_map(gkey);
-        g.idx(end+1) = i;
-        group_map(gkey) = g;
-    else
-        g.orig_rate = orig_rate;
-        g.L         = L;
-        g.idx       = i;
-        group_map(gkey) = g;
+
+    if abs(orig_rate - target_rate) < 1e-9
+        % already at target rate
+        continue
     end
-end
 
-% --- Resample each group, chunked by RAM budget ----------------------------
-% RAM headroom: a resample() call on an L x C double matrix peaks at
-% roughly 3-4x the input matrix bytes (input + output + internal scratch).
-safety_factor = 4;
+    [P, Q] = rat(target_rate / orig_rate, 1e-6);
+    if verbose
+        fprintf('  resample %s: %g Hz -> %g Hz (ratio %d/%d)\n', ...
+                strtrim(signal_header(i).signal_labels), orig_rate, target_rate, P, Q);
+    end
 
-gkeys = group_map.keys;
-for gk = 1:numel(gkeys)
-    g = group_map(gkeys{gk});
-    [P, Q] = rat(target_rate / g.orig_rate, 1e-6);
+    x = signal_cell{i};
     cache_key = sprintf('%d_%d', P, Q);
     if isKey(resample_filter_cache, cache_key)
-        b = resample_filter_cache(cache_key);
+        y = resample(x(:), P, Q, resample_filter_cache(cache_key));
     else
-        [~, b] = resample(zeros(20,1), P, Q);
+        [y, b] = resample(x(:), P, Q);
         resample_filter_cache(cache_key) = b;
     end
+    y = y(:)';   % keep row-vector convention used by read_EDF outputs
 
-    bytes_per_ch = g.L * 8;
-    chunk_ch = max(1, floor(max_block_bytes / (bytes_per_ch * safety_factor)));
-    if verbose
-        fprintf('  group: %g Hz -> %g Hz (ratio %d/%d), %d ch x %d samp, chunks of %d ch\n', ...
-                g.orig_rate, target_rate, P, Q, numel(g.idx), g.L, chunk_ch);
+    % Trim to integer multiple of new_spr
+    n_records = floor(numel(y) / new_spr);
+    if n_records < 1
+        error('convert_EDF:TooShort', ...
+            'After resampling, signal %d (%s) has no complete records.', ...
+            i, signal_header(i).signal_labels);
+    end
+    if numel(y) > n_records * new_spr
+        if verbose
+            fprintf('    trimming %d trailing samples to fit record boundary\n', ...
+                    numel(y) - n_records * new_spr);
+        end
+        y = y(1 : n_records * new_spr);
     end
 
-    for cs = 1:chunk_ch:numel(g.idx)
-        ce = min(cs + chunk_ch - 1, numel(g.idx));
-        chunk = g.idx(cs:ce);
-
-        % Stack channels as columns of an L x nchunk matrix
-        X = zeros(g.L, numel(chunk));
-        for c = 1:numel(chunk)
-            X(:, c) = signal_cell{chunk(c)}(:);
-        end
-
-        Y = resample(X, P, Q, b);
-
-        for c = 1:numel(chunk)
-            i = chunk(c);
-            y = Y(:, c)';
-            n_records = floor(numel(y) / new_spr);
-            if n_records < 1
-                error('convert_EDF:TooShort', ...
-                    'After resampling, signal %d (%s) has no complete records.', ...
-                    i, signal_header(i).signal_labels);
-            end
-            if numel(y) > n_records * new_spr
-                y = y(1 : n_records * new_spr);
-            end
-            new_signal_cell{i}                       = y;
-            new_signal_header(i).samples_in_record   = new_spr;
-            new_signal_header(i).sampling_frequency  = target_rate;
-        end
-        clear X Y
-    end
+    new_signal_cell{i}                       = y;
+    new_signal_header(i).samples_in_record   = new_spr;
+    new_signal_header(i).sampling_frequency  = target_rate;
 end
 
 % --- Update header.num_data_records ----------------------------------------

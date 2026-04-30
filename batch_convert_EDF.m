@@ -41,15 +41,6 @@ function result = batch_convert_EDF(input_spec, target_rate, varargin)
 %       'Verbose'      : false (default)
 %       'AutoScale'    : 'recompute' (default) | 'preserve'. See convert_EDF
 %                        for the rationale on why 'recompute' is the default.
-%       'MaxResampleBlockMB' : [] (default; auto-tuned). Per-call cap on
-%                        the size of any single resample() matrix call.
-%                        Channels of the same source rate and length are
-%                        grouped and resampled in one call (column-wise);
-%                        this cap chunks the group when the stacked
-%                        matrix would exceed the budget. Auto default is
-%                        ~50% of available RAM divided by parpool worker
-%                        count, so serial runs use a much larger budget
-%                        than parallel ones.
 %
 %   Output:
 %       result : table with columns
@@ -79,7 +70,6 @@ addParameter(p, 'StageDir',     '', @ischar);
 addParameter(p, 'Pattern',      '*.edf', @ischar);
 addParameter(p, 'Verbose',      false, @islogical);
 addParameter(p, 'AutoScale',    'recompute', @(s) any(strcmpi(s, {'preserve','recompute'})));
-addParameter(p, 'MaxResampleBlockMB', [], @(x) isempty(x) || (isnumeric(x) && isscalar(x) && x > 0));
 parse(p, input_spec, target_rate, varargin{:});
 
 target_rate  = double(p.Results.target_rate);
@@ -95,7 +85,6 @@ stage_dir    = p.Results.StageDir;
 pattern      = p.Results.Pattern;
 verbose      = p.Results.Verbose;
 autoscale    = p.Results.AutoScale;
-max_resample_mb = p.Results.MaxResampleBlockMB;  % may be [] -> auto-tune below
 
 if isempty(compress_mode)
     if compress, compress_mode = 'zstd'; else, compress_mode = 'none'; end
@@ -151,21 +140,6 @@ if do_parallel
     end
 end
 
-% --- Auto-tune resample block budget --------------------------------------
-% In serial we get the whole machine; in parallel each worker gets a share.
-if isempty(max_resample_mb)
-    if do_parallel && ~isempty(gcp('nocreate'))
-        n_workers = gcp('nocreate').NumWorkers;
-    else
-        n_workers = 1;
-    end
-    max_resample_mb = auto_block_mb(n_workers);
-    if verbose
-        fprintf('  auto MaxResampleBlockMB = %d (n_workers=%d)\n', ...
-                max_resample_mb, n_workers);
-    end
-end
-
 % --- Run -----------------------------------------------------------------
 n = numel(files);
 out_paths      = cell(n, 1);
@@ -180,7 +154,7 @@ if do_parallel
     parfor k = 1:n
         [out_paths{k}, statuses{k}, elapsed_s(k), error_messages{k}] = ...
             run_one(files{k}, target_rate, out_dir, compress_mode, ...
-                    gzip_level, zstd_level, autoscale, max_resample_mb, ...
+                    gzip_level, zstd_level, autoscale, ...
                     stage_local, stage_dir, false);
     end
 else
@@ -188,7 +162,7 @@ else
         if verbose, fprintf('  [%d/%d] %s\n', k, n, files{k}); end
         [out_paths{k}, statuses{k}, elapsed_s(k), error_messages{k}] = ...
             run_one(files{k}, target_rate, out_dir, compress_mode, ...
-                    gzip_level, zstd_level, autoscale, max_resample_mb, ...
+                    gzip_level, zstd_level, autoscale, ...
                     stage_local, stage_dir, verbose);
     end
 end
@@ -205,7 +179,7 @@ end
 
 %% =========================================================================
 function [out_path, status, elapsed, errmsg] = run_one(in_fname, target_rate, ...
-    out_dir, compress_mode, gzip_level, zstd_level, autoscale, max_resample_mb, ...
+    out_dir, compress_mode, gzip_level, zstd_level, autoscale, ...
     stage_local, stage_dir, verbose)
 
 t0 = tic;
@@ -256,8 +230,7 @@ try
             'GzipLevel',    gzip_level, ...
             'ZstdLevel',    zstd_level, ...
             'Verbose',      verbose, ...
-            'AutoScale',    autoscale, ...
-            'MaxResampleBlockMB', max_resample_mb);
+            'AutoScale',    autoscale);
 
         movefile(local_out, final_out, 'f');
     else
@@ -267,8 +240,7 @@ try
             'GzipLevel',    gzip_level, ...
             'ZstdLevel',    zstd_level, ...
             'Verbose',      verbose, ...
-            'AutoScale',    autoscale, ...
-            'MaxResampleBlockMB', max_resample_mb);
+            'AutoScale',    autoscale);
     end
 
     out_path = final_out;
@@ -332,38 +304,4 @@ function t = empty_result_table()
 t = table('Size', [0 5], ...
     'VariableTypes', {'string', 'string', 'string', 'double', 'string'}, ...
     'VariableNames', {'input', 'output', 'status', 'elapsed_s', 'error_message'});
-end
-
-
-%% =========================================================================
-function mb = auto_block_mb(n_workers)
-%AUTO_BLOCK_MB  Pick a per-worker resample block size (MB) from system free RAM.
-%
-%   Uses ~50% of currently-available memory, divided by n_workers, capped
-%   to a sensible range. Falls back to 4 GB if memory can't be queried.
-
-avail_bytes = NaN;
-try
-    if isunix && ~ismac
-        [s, o] = system('grep MemAvailable /proc/meminfo | awk ''{print $2}''');
-        if s == 0, avail_bytes = str2double(strtrim(o)) * 1024; end
-    elseif ismac
-        [s, o] = system('vm_stat | awk ''/page size of/ {print $8} /Pages free/ {gsub(/\./,""); print $3} /Pages inactive/ {gsub(/\./,""); print $3}''');
-        if s == 0
-            v = str2double(strsplit(strtrim(o), '\n'));
-            if numel(v) >= 3, avail_bytes = v(1) * (v(2) + v(3)); end
-        end
-    elseif ispc
-        m = memory;
-        avail_bytes = m.MemAvailableAllArrays;
-    end
-catch
-end
-if isnan(avail_bytes) || avail_bytes <= 0
-    avail_bytes = 8 * 1024^3;  % fallback: assume 8 GB available
-end
-
-mb = floor(avail_bytes * 0.5 / max(1, n_workers) / 1024 / 1024);
-mb = max(mb, 256);     % don't go below 256 MB; resample needs room to work
-mb = min(mb, 32768);   % cap at 32 GB; beyond this we'd usually swap anyway
 end
