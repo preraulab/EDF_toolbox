@@ -327,6 +327,26 @@ Notes:
 
 The Rust binary defaults to gzip-9 while MATLAB defaults to zstd-9 because MATLAB's gzip path is single-threaded; the parallel-gzip win in `gzp` does not transfer there. On a 24-core box the Rust pipeline finishes a 10-file batch in ~11 s vs ~38 s for MATLAB.
 
+#### Resampler caveat — Rust FFT FIR vs MATLAB Kaiser sinc
+
+The Rust pipeline uses `rubato`'s `FftFixedIn` (FFT-domain anti-alias multiply); the MATLAB pipeline uses SPT's `resample` (Kaiser-windowed sinc FIR, β≈5). Both are linear-phase / zero-phase (Rust's group delay is compensated internally) and both anti-alias correctly into the target Nyquist band, but their stopband shape near Nyquist is not identical.
+
+For a 40160 s clinical PSG resampled 128 → 100 Hz, MATLAB-resampled vs Rust-resampled samples agree to:
+
+- **Lag**: 0 samples (zero-phase, time-aligned)
+- **RMS difference**: ~3.7 % of signal RMS over the full record
+- **Per-sample**: typically <0.5 µV against a ~30 µV-RMS EEG signal
+
+![Rust vs MATLAB resample, 5 s window](docs/_static/rust_vs_matlab_resample_5s.png)
+
+*5 s window of channel C3-A2: raw (black, 128 Hz), MATLAB resample (blue dashed, 100 Hz), Rust resample (red dotted, 100 Hz). Bottom panel is MATLAB − Rust, bounded at ±0.5 µV — the residual is high-frequency energy near Nyquist where the two filters' transition bands disagree slightly. No DC offset, no time skew.*
+
+What this means in practice:
+
+- **Sleep / EEG analysis (delta, theta, alpha, sigma/spindle, beta, low gamma — anything ≤30 Hz)**: indistinguishable. Use either.
+- **High-gamma analysis (60–90 Hz on a 200+ Hz target rate) or sharp-spike morphology**: the last few Hz before Nyquist may differ by O(1 µV). If you need bit-exact MATLAB-resample output, use the MATLAB pipeline.
+- **Round-trip / archival**: the two outputs are not byte-identical. They are scientifically equivalent within the band of interest for sleep work, but downstream analyses that hash or diff signal arrays will not match across the two pipelines.
+
 ### Inspect the header in a GUI
 
 ```matlab
