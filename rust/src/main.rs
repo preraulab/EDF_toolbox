@@ -194,7 +194,13 @@ fn main() -> Result<()> {
     println!("convert_edf: {} files, target {} Hz, {}",
              pairs.len(), args.target_rate, mode_msg);
 
+    let n = pairs.len();
     let t0 = Instant::now();
+    // Live progress counter -- atomically incremented as each file
+    // finishes. With many rayon workers, file completions arrive out of
+    // order; this counter is the user-visible "N of total done" tally.
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    // Approximate ETA from the wall time so far. Cheap and good enough.
     let outcomes: Vec<(PathBuf, Result<f64>)> = pairs
         .par_iter()
         .map(|(root, input)| {
@@ -205,15 +211,38 @@ fn main() -> Result<()> {
             // Ensure parent dir of `out` exists (mirrored subdirs).
             if let Some(parent) = out.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
+                    let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if args.verbose {
+                        println!("[{}/{}] fail {}: creating {}: {}",
+                                 i, n, input.display(), parent.display(), e);
+                    }
                     return (input.clone(),
                         Err(anyhow!("creating {}: {}", parent.display(), e)));
                 }
             }
             let t1 = Instant::now();
-            match convert_one(input, &out, &args) {
-                Ok(()) => (input.clone(), Ok(t1.elapsed().as_secs_f64())),
-                Err(e) => (input.clone(), Err(e)),
+            let result = match convert_one_quiet(input, &out, &args) {
+                Ok(()) => Ok(t1.elapsed().as_secs_f64()),
+                Err(e) => Err(e),
+            };
+            let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if args.verbose {
+                let elapsed = t0.elapsed().as_secs_f64();
+                // ETA: extrapolate from completed/elapsed. Avoid div-by-zero.
+                let eta = if i > 0 && i < n {
+                    let per = elapsed / i as f64;
+                    per * (n - i) as f64
+                } else { 0.0 };
+                match &result {
+                    Ok(secs) => println!(
+                        "[{}/{}] ok   {} ({:.2}s) | elapsed {:.0}s, ETA {:.0}s",
+                        i, n, input.display(), secs, elapsed, eta),
+                    Err(e) => println!(
+                        "[{}/{}] fail {}: {:#}", i, n, input.display(), e),
+                }
+                std::io::stdout().flush().ok();
             }
+            (input.clone(), result)
         })
         .collect();
     let total = t0.elapsed().as_secs_f64();
@@ -221,23 +250,18 @@ fn main() -> Result<()> {
     let mut ok = 0usize;
     for (path, res) in &outcomes {
         match res {
-            Ok(secs) => {
-                ok += 1;
-                if args.verbose {
-                    println!("[ok]   {} ({:.2}s)", path.display(), secs);
-                }
-            }
-            Err(e) => println!("[fail] {}: {:#}", path.display(), e),
+            Ok(_) => ok += 1,
+            // Always surface failures, even without -v (so silent runs
+            // still tell you what didn't make it).
+            Err(e) if !args.verbose => println!("[fail] {}: {:#}", path.display(), e),
+            Err(_) => {}  // already printed live under -v
         }
     }
     println!(
         "done: {}/{} ok in {:.1}s wall ({:.2} files/s)",
-        ok,
-        outcomes.len(),
-        total,
-        outcomes.len() as f64 / total
+        ok, n, total, n as f64 / total
     );
-    if ok < outcomes.len() {
+    if ok < n {
         std::process::exit(1);
     }
     Ok(())
@@ -443,11 +467,23 @@ fn compress_from_path(p: &Path) -> Option<Compress> {
 }
 
 fn convert_one(input: &Path, output: &Path, args: &Args) -> Result<()> {
-    if args.verbose {
+    convert_one_inner(input, output, args, args.verbose)
+}
+
+/// Internal entry point that lets the batch mode suppress the per-file
+/// header / channel dump (which is useful when debugging one file but
+/// pure noise across hundreds). Live `[N/total]` progress lines come
+/// from main()'s loop, not from here.
+fn convert_one_quiet(input: &Path, output: &Path, args: &Args) -> Result<()> {
+    convert_one_inner(input, output, args, false)
+}
+
+fn convert_one_inner(input: &Path, output: &Path, args: &Args, verbose: bool) -> Result<()> {
+    if verbose {
         eprintln!("opening {}", input.display());
     }
     let (mut hdr, data_i16) = edf::read_edf_path(input)?;
-    if args.verbose {
+    if verbose {
         eprintln!(
             "  header: {} signals, {} records x {}s",
             hdr.num_signals, hdr.num_data_records, hdr.data_record_duration
