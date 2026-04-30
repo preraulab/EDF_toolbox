@@ -325,8 +325,9 @@ Typical speedup for a full-night PSG file: 5-20× over the pure-MATLAB path, dep
 
 zstd at level 9 is the default for `convert_EDF`. On real EDF data:
 
-- zstd-9 is **~2× faster** to compress than gzip-6 with **~20 % smaller** output and **~5–10× faster** decode (gzip's slow decoder is the kicker on the read side, not just compress wall time).
-- zstd decompression is roughly level-independent, so picking a stronger zstd level (9 vs 3) costs nothing on read.
+- zstd-9 is **~2× faster** to compress than gzip-6 with **~20 % smaller** output.
+- Decompression is fast for both codecs — the absolute overhead per file is tens of ms either way, so total read time differs by only a few percent. Read time is essentially codec-independent; pick zstd for the write-side and size wins.
+- zstd decompression is also roughly level-independent, so picking a stronger zstd level (9 vs 3) costs nothing on read.
 - zstd-9 is ~9 % smaller than zstd-3 for ~50 % extra compress wall — the right tradeoff for archival writes that get read many times.
 
 Use `.edf.gz` only when handing files to a tool that does not understand `.zst`. All three modes produce bit-identical decoded signals.
