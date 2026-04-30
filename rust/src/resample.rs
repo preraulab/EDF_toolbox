@@ -7,6 +7,14 @@
 //! [`resample_channels`] runs all channels through one resampler instance
 //! in lockstep, which is meaningfully faster than instantiating a fresh
 //! resampler per channel (each instance allocates FFT plans + buffers).
+//!
+//! Zero-phase alignment: `FftFixedIn` is a linear-phase FIR with a
+//! constant group delay of `resampler.output_delay()` output samples.
+//! We compensate by (a) discarding that many leading output samples and
+//! (b) feeding zero-padded chunks past end-of-input so the trailing real
+//! samples are flushed out of the filter pipeline. The final output has
+//! length `round(n_in * target_rate / orig_rate)` and is time-aligned
+//! with the input — matching MATLAB's `resample()` to <1% RMS.
 
 use anyhow::{Context, Result};
 use rubato::{FftFixedIn, Resampler};
@@ -49,38 +57,75 @@ pub fn resample_channels(
     )
     .context("creating FftFixedIn resampler")?;
 
-    let needed = resampler.input_frames_next();
-    let est_out = ((n_in as f64) * target_rate / orig_rate) as usize + needed;
-    let mut output: Vec<Vec<f32>> =
-        (0..nbr_channels).map(|_| Vec::with_capacity(est_out)).collect();
+    // Linear-phase group delay (in output samples) of the FFT FIR. We strip
+    // this many leading samples from the assembled output to make the
+    // resampler zero-phase relative to the input.
+    let leading_delay = resampler.output_delay();
+    // Final output length to return (matches MATLAB resample's length convention).
+    let expected_out = ((n_in as f64) * (out_rate as f64) / (in_rate as f64)).round() as usize;
+    // We need to collect leading_delay + expected_out output samples total.
+    let target_collect = leading_delay + expected_out;
 
-    // Per-call input buffer: outer = channels, inner = chunk samples
+    let needed = resampler.input_frames_next();
+    let mut output: Vec<Vec<f32>> = (0..nbr_channels)
+        .map(|_| Vec::with_capacity(target_collect + needed))
+        .collect();
+
+    // Per-call input buffer: outer = channels, inner = chunk samples.
     let mut inbuf: Vec<Vec<f32>> = (0..nbr_channels).map(|_| vec![0.0f32; needed]).collect();
 
     let mut pos = 0usize;
-    while pos < n_in {
-        let real_in = (n_in - pos).min(needed);
+    // Keep processing chunks until every channel has at least target_collect
+    // output samples. After we run out of real input we feed zero-padded
+    // chunks to flush the FIR pipeline (this is what recovers the trailing
+    // real samples that would otherwise be lost to group delay).
+    loop {
+        let have = output[0].len();
+        if have >= target_collect {
+            break;
+        }
+        let need_in_this_chunk = resampler.input_frames_next();
+        if need_in_this_chunk != needed {
+            // FftFixedIn has constant input_frames_next, but be defensive.
+            for ch_buf in inbuf.iter_mut() {
+                ch_buf.resize(need_in_this_chunk, 0.0);
+            }
+        }
+        let real_in = if pos < n_in {
+            (n_in - pos).min(need_in_this_chunk)
+        } else {
+            0
+        };
         for (ci, ch) in channels.iter().enumerate() {
-            inbuf[ci][..real_in].copy_from_slice(&ch[pos..pos + real_in]);
-            if real_in < needed {
+            if real_in > 0 {
+                inbuf[ci][..real_in].copy_from_slice(&ch[pos..pos + real_in]);
+            }
+            if real_in < need_in_this_chunk {
                 inbuf[ci][real_in..].fill(0.0);
             }
         }
         let out = resampler.process(&inbuf, None).context("resampler block")?;
-        if real_in == needed {
-            for (ci, oc) in output.iter_mut().enumerate() {
-                oc.extend_from_slice(&out[ci]);
-            }
-        } else {
-            // Tail: output corresponds to real_in real samples plus padding.
-            let real_out = (real_in as f64 * target_rate / orig_rate).round() as usize;
-            for (ci, oc) in output.iter_mut().enumerate() {
-                let take = real_out.min(out[ci].len());
-                oc.extend_from_slice(&out[ci][..take]);
-            }
+        for (ci, oc) in output.iter_mut().enumerate() {
+            oc.extend_from_slice(&out[ci]);
+        }
+        pos += real_in;
+        // Safety: if we are past EOF and the resampler produces nothing,
+        // bail rather than spin forever.
+        if real_in == 0 && out[0].is_empty() {
             break;
         }
-        pos += needed;
+    }
+
+    // Trim leading group delay and truncate to expected length.
+    for oc in output.iter_mut() {
+        if oc.len() > leading_delay {
+            oc.drain(..leading_delay);
+        } else {
+            oc.clear();
+        }
+        if oc.len() > expected_out {
+            oc.truncate(expected_out);
+        }
     }
 
     Ok(output)
