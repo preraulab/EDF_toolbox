@@ -23,7 +23,8 @@ pub struct Header {
     pub recording_id: String,
     pub start_date: String, // dd.mm.yy
     pub start_time: String, // hh.mm.ss
-    pub bytes_in_header: u32,
+    // bytes_in_header is parsed but not stored; we recompute it on write
+    // from `256 + num_signals * 256`.
     pub reserved: String, // EDF+C / EDF+D / blank
     pub num_data_records: i64,
     pub data_record_duration: f64, // seconds
@@ -90,7 +91,8 @@ pub fn read_header<R: Read>(r: &mut R) -> Result<Header> {
     let recording_id = read_str(r, 80)?;
     let start_date = read_str(r, 8)?;
     let start_time = read_str(r, 8)?;
-    let bytes_in_header: u32 = parse_field(&read_str(r, 8)?, "bytes_in_header")?;
+    // Parsed but not stored; we recompute on write.
+    let _bytes_in_header: u32 = parse_field(&read_str(r, 8)?, "bytes_in_header")?;
     let reserved = read_str(r, 44)?;
     let num_data_records: i64 = parse_field(&read_str(r, 8)?, "num_data_records")?;
     let data_record_duration: f64 = parse_field(&read_str(r, 8)?, "data_record_duration")?;
@@ -98,7 +100,7 @@ pub fn read_header<R: Read>(r: &mut R) -> Result<Header> {
     if std::env::var("EDF_DEBUG").is_ok() {
         eprintln!(
             "DEBUG main: bih={} reserved='{}' nrec={} dur={} ns={}",
-            bytes_in_header, reserved.trim(), num_data_records, data_record_duration, num_signals
+            _bytes_in_header, reserved.trim(), num_data_records, data_record_duration, num_signals
         );
     }
 
@@ -174,7 +176,6 @@ pub fn read_header<R: Read>(r: &mut R) -> Result<Header> {
         recording_id,
         start_date,
         start_time,
-        bytes_in_header,
         reserved,
         num_data_records,
         data_record_duration,
