@@ -35,7 +35,7 @@ For one-shot batch conversion of many files, the **standalone Rust binary** is ~
 
 ```sh
 cd rust && cargo build --release
-./target/release/convert_edf --batch /path/to/edfs -r 100 --out /path/out
+./target/release/convert_edf --batch /path/to/edfs -F 100 --out /path/out
 # default output: .edf.gz (gzip-9, parallel, all cores)
 ```
 
@@ -270,44 +270,44 @@ Defaults — `--compress gzip --gzip-level 9`, `--auto-scale recompute`, `--jobs
 
 ```sh
 # A single file
-./convert_edf -r 100 -o output.edf.gz input.edf
+./convert_edf -F 100 -o output.edf.gz input.edf
 
 # A whole directory (top-level only)
-./convert_edf -r 100 --out /data/edfs_out /data/edfs_in
+./convert_edf -F 100 --out /data/edfs_out /data/edfs_in
 
 # A directory tree, recursively (mirrors source structure under --out)
-./convert_edf -r 100 --out /data/edfs_out -R /data/study_root
+./convert_edf -F 100 --out /data/edfs_out -R /data/study_root
 
 # Several specific files
-./convert_edf -r 100 --out /data/edfs_out a.edf b.edf c.edf
+./convert_edf -F 100 --out /data/edfs_out a.edf b.edf c.edf
 
 # Mix of files and directories in one shot
-./convert_edf -r 100 --out /data/edfs_out -R one.edf /data/edfs_in /data/more
+./convert_edf -F 100 --out /data/edfs_out -R one.edf /data/edfs_in /data/more
 ```
 
 Recursive output is mirrored into `--out` by default — e.g. `/in/sub/foo.edf` becomes `/out/sub/foo_100Hz.edf.gz`. Pass `--flatten` to drop everything at the top of `--out`:
 
 ```sh
-./convert_edf -r 100 --out /flat -R --flatten /data/study_root
+./convert_edf -F 100 --out /flat -R --flatten /data/study_root
 ```
 
 Codec, parallelism, and verbosity work the same regardless of input shape:
 
 ```sh
 # Force zstd output (faster decode, slightly bigger than gzip-9, slower to write)
-./convert_edf -r 100 --out /out --compress zstd --zstd-level 3 -R /in
+./convert_edf -F 100 --out /out --compress zstd --zstd-level 3 -R /in
 
 # Pure resample, no compression (fastest write, biggest output)
-./convert_edf -r 100 --out /out --compress none /in
+./convert_edf -F 100 --out /out --compress none /in
 
 # Maximum compression for write-once archives (much slower, ~10 % smaller)
-./convert_edf -r 100 --out /out --compress zstd --zstd-level 19 -R /in
+./convert_edf -F 100 --out /out --compress zstd --zstd-level 19 -R /in
 
 # Limit parallelism (e.g. on a shared box)
-./convert_edf -r 100 --out /out --jobs 8 /in
+./convert_edf -F 100 --out /out --jobs 8 /in
 
 # Verbose progress
-./convert_edf -r 100 --out /out -v /in
+./convert_edf -F 100 --out /out -v /in
 ```
 
 Notes:

@@ -1,10 +1,10 @@
 //! convert_edf -- standalone EDF resample / rewrite tool.
 //!
 //! Usage:
-//!   convert_edf input.edf -r 100 -o output.edf.gz
-//!   convert_edf -r 100 -o /path/to/out /path/to/edfs
-//!   convert_edf -r 100 -o /path/to/out -R /path/to/study_root
-//!   convert_edf -r 100 -o /path/to/out a.edf b.edf c.edf
+//!   convert_edf input.edf -F 100 -o output.edf.gz
+//!   convert_edf -F 100 -o /path/to/out /path/to/edfs
+//!   convert_edf -F 100 -o /path/to/out -R /path/to/study_root
+//!   convert_edf -F 100 -o /path/to/out a.edf b.edf c.edf
 //!
 //! Positional arguments may be files or directories, mixed. Pass `-R` to
 //! recurse into subdirectories. Output structure mirrors the source tree
@@ -51,7 +51,7 @@ struct Args {
     inputs: Vec<PathBuf>,
 
     /// Backward-compat alias for passing a single directory positionally.
-    /// Prefer the positional form: `convert_edf -r 100 --out OUT /path/to/dir`.
+    /// Prefer the positional form: `convert_edf -F 100 --out OUT /path/to/dir`.
     #[arg(long, hide = true)]
     batch: Option<PathBuf>,
 
@@ -65,7 +65,10 @@ struct Args {
     flatten: bool,
 
     /// Target sampling rate (Hz). Required unless --read-bench is set.
-    #[arg(short = 'r', long, default_value_t = 0.0)]
+    /// Short form is -F (sampling frequency, Fs). -r is intentionally not
+    /// used to avoid visual confusion with -R (recursive). --rate is
+    /// accepted as a long alias.
+    #[arg(short = 'F', long = "target-rate", visible_alias = "rate", default_value_t = 0.0)]
     target_rate: f64,
 
     /// Read-only benchmark: read every input EDF (decompressing as needed)
@@ -123,7 +126,7 @@ fn main() -> Result<()> {
         bail!("no inputs given (pass FILE..., DIR..., or --batch DIR)");
     }
     if !args.read_bench && args.target_rate <= 0.0 {
-        bail!("--target-rate / -r is required (or pass --read-bench to skip conversion)");
+        bail!("--target-rate / -F is required (or pass --read-bench to skip conversion)");
     }
 
     if args.jobs > 0 {
