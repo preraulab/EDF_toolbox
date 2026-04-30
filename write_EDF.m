@@ -32,7 +32,7 @@ function write_EDF(out_fname, header, signal_header, signal_cell, varargin)
 %                                              fits within int16 dynamic range)
 %       'GzipLevel'   : integer 1..9 (default 6). Used only when out_fname
 %                       ends in '.gz'. Lower = faster, larger output.
-%       'ZstdLevel'   : integer 1..22 (default 3). Used only when out_fname
+%       'ZstdLevel'   : integer 1..22 (default 9). Used only when out_fname
 %                       ends in '.zst'. Higher = slower, smaller output.
 %       'debug'       : logical (default false)
 %
@@ -73,7 +73,7 @@ addParameter(p, 'Verbose',     false, @islogical);
 addParameter(p, 'forceMATLAB', false, @islogical);
 addParameter(p, 'AutoScale',   'preserve', @(s) any(strcmpi(s, {'preserve','recompute'})));
 addParameter(p, 'GzipLevel',   6, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 9);
-addParameter(p, 'ZstdLevel',   3, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
+addParameter(p, 'ZstdLevel',   9, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
 addParameter(p, 'debug',       false, @islogical);
 parse(p, varargin{:});
 

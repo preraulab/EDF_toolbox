@@ -16,7 +16,7 @@ function result = batch_convert_EDF(input_spec, target_rate, varargin)
 %       'Compress'     : (deprecated) true -> 'zstd', false -> 'none'.
 %                        'CompressMode' takes precedence if both are passed.
 %       'GzipLevel'    : integer 1..9 (default 6)
-%       'ZstdLevel'    : integer 1..22 (default 3)
+%       'ZstdLevel'    : integer 1..22 (default 9)
 %       'Parallel'     : true (default if a parpool exists). When true and no
 %                        pool exists, attempts to start one; falls back to
 %                        serial on failure.
@@ -62,7 +62,7 @@ addParameter(p, 'OutputDir',    '', @ischar);
 addParameter(p, 'CompressMode', '', @(s) ischar(s) && (isempty(s) || any(strcmpi(s, {'gzip','zstd','none'}))));
 addParameter(p, 'Compress',     true, @islogical);
 addParameter(p, 'GzipLevel',    6, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 9);
-addParameter(p, 'ZstdLevel',    3, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
+addParameter(p, 'ZstdLevel',    9, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
 addParameter(p, 'Parallel',     [], @(x) isempty(x) || islogical(x));
 addParameter(p, 'WorkerThreads',1, @(x) isnumeric(x) && isscalar(x) && x >= 1);
 addParameter(p, 'StageLocal',   false, @islogical);

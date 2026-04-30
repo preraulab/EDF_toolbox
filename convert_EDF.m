@@ -23,7 +23,11 @@ function out_path = convert_EDF(in_fname, target_rate, varargin)
 %       'Compress'     : (deprecated) true -> 'zstd', false -> 'none'.
 %                        'CompressMode' takes precedence if both are passed.
 %       'GzipLevel'    : integer 1..9 (default 6). Used for .gz outputs.
-%       'ZstdLevel'    : integer 1..22 (default 3). Used for .zst outputs.
+%       'ZstdLevel'    : integer 1..22 (default 9). Used for .zst outputs.
+%                        9 is the recommended sweet spot: ~9% smaller than
+%                        zstd-3 for ~50% extra compress wall time, and
+%                        decompression is roughly level-independent so
+%                        downstream read time is unchanged.
 %       'Verbose'      : logical (default false)
 %       'AutoScale'    : 'recompute' (default) | 'preserve' (passed to
 %                        write_EDF). 'recompute' resets each channel's
@@ -61,7 +65,7 @@ addParameter(p, 'OutputName',   '', @ischar);
 addParameter(p, 'CompressMode', '', @(s) ischar(s) && (isempty(s) || any(strcmpi(s, {'gzip','zstd','none'}))));
 addParameter(p, 'Compress',     true, @islogical);
 addParameter(p, 'GzipLevel',    6, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 9);
-addParameter(p, 'ZstdLevel',    3, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
+addParameter(p, 'ZstdLevel',    9, @(x) isnumeric(x) && isscalar(x) && x >= 1 && x <= 22);
 addParameter(p, 'Verbose',      false, @islogical);
 addParameter(p, 'AutoScale',    'recompute', @(s) any(strcmpi(s, {'preserve','recompute'})));
 parse(p, in_fname, target_rate, varargin{:});

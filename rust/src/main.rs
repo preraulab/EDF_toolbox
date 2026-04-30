@@ -64,8 +64,11 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Compress::Zstd)]
     compress: Compress,
 
-    /// Zstd compression level (1-22).
-    #[arg(long, default_value_t = 3)]
+    /// Zstd compression level (1-22). Default 9 -- best size/speed tradeoff
+    /// for typical EDF archival on multi-core boxes (~9% smaller than zstd-3
+    /// for ~50% extra wall; read time is unchanged since zstd decompression
+    /// is roughly level-independent).
+    #[arg(long, default_value_t = 9)]
     zstd_level: i32,
 
     /// Gzip compression level (1-9).

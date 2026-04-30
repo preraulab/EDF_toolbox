@@ -13,7 +13,7 @@
 #   -o, --output-dir DIR       Output directory (default: alongside input)
 #       --compress-mode MODE   zstd (default) | gzip | none
 #       --gzip-level N         1..9 (default 6)
-#       --zstd-level N         1..22 (default 3)
+#       --zstd-level N         1..22 (default 9)
 #       --no-gzip              (deprecated) alias for --compress-mode none
 #       --no-parallel          Disable parfor
 #       --worker-threads N     BLAS threads per parpool worker (default 1).
@@ -45,7 +45,7 @@ RATE=""
 OUT_DIR=""
 COMPRESS_MODE="zstd"
 GZIP_LEVEL="6"
-ZSTD_LEVEL="3"
+ZSTD_LEVEL="9"
 PARALLEL="true"
 WORKER_THREADS="1"
 STAGE_LOCAL="false"

@@ -195,7 +195,7 @@ fprintf('%d / %d files converted, total elapsed %.1f s\n', ...
 disp(result(strcmp(result.status, 'failed'), {'input', 'error_message'}));
 ```
 
-**Parallelism note — `WorkerThreads`.** `batch_convert_EDF` runs `parfor` across files. By default each parpool worker is pinned to **1 BLAS thread** (`'WorkerThreads', 1`). Without this pin, the default Process-profile worker tries to use every core for its internal BLAS pool, and `N_workers × N_cores` threads competing for `N_cores` causes catastrophic CPU contention — `resample`'s FIR filter slows down so much that parallel runs *4-8× slower than serial* on multi-core boxes. The default works correctly for almost every case; only override if you have a specific reason and spare cores.
+**Parallelism note — `WorkerThreads`.** `batch_convert_EDF` runs `parfor` across files and pins each parpool worker to **1 BLAS thread** by default (`'WorkerThreads', 1`). Without this pin, every worker's internal BLAS pool tries to use every core, and `N_workers × N_cores` threads competing for `N_cores` makes `resample` run *several × slower than serial*. The default works correctly for almost every case; only override if you know your workload is not BLAS-heavy and you have spare cores.
 
 ```matlab
 % Almost always correct: rely on the default WorkerThreads=1
@@ -283,7 +283,7 @@ The CLI shells out to MATLAB once per invocation — startup cost (~10 s) is amo
 | `compile_edf_mex.m` | Shared auto-compile helper (vendored zlib + system libzstd) |
 | `zlib/` | Vendored zlib 1.3.2 source (BSD-style license). Compiled into both MEX files so there's no system zlib dependency. |
 | `header_gui.m` | Optional UI for inspecting header + signal-header tables |
-| `bench_convert_modes.m` | Benchmark helper: times `batch_convert_EDF` in serial / parallel / staged modes on a directory of EDFs and writes raw + summary CSVs. Useful for finding the right `Workers` / `WorkerThreads` / `StageDir` settings on a new machine. |
+| `rust/` | Optional standalone Rust port of the read → resample → write pipeline. Roughly 3× faster than the MATLAB pipeline on the same hardware; useful for one-shot batch conversion of large corpora. Build with `cd rust && cargo build --release`. |
 
 If a pre-built MEX isn't available for your platform (Linux, Windows), `read_EDF.m` and `write_EDF.m` will auto-compile on first call. The build pulls in the vendored zlib (no system dep) and links against the system **libzstd** for `.edf.zst` support — the auto-compile script searches `/opt/homebrew` and `/usr/local` for it. To rebuild manually:
 
@@ -323,7 +323,13 @@ Typical speedup for a full-night PSG file: 5-20× over the pure-MATLAB path, dep
 
 ### gzip vs zstd
 
-zstd at level 3 is the default for `convert_EDF` because on real EDF data it is roughly 5× faster than gzip level 6 with similar or slightly better compression ratios. gzip level 1 is roughly 2× faster than gzip level 6 with a small (~few percent) size penalty, so it is a reasonable fast-path if you must keep `.edf.gz` for compatibility with downstream tools. All three modes produce bit-identical decoded signals.
+zstd at level 9 is the default for `convert_EDF`. On real EDF data:
+
+- zstd-9 is **~2× faster** to compress than gzip-6 with **~20 % smaller** output and **~5–10× faster** decode (gzip's slow decoder is the kicker on the read side, not just compress wall time).
+- zstd decompression is roughly level-independent, so picking a stronger zstd level (9 vs 3) costs nothing on read.
+- zstd-9 is ~9 % smaller than zstd-3 for ~50 % extra compress wall — the right tradeoff for archival writes that get read many times.
+
+Use `.edf.gz` only when handing files to a tool that does not understand `.zst`. All three modes produce bit-identical decoded signals.
 
 ### Pure-MATLAB fallback
 
