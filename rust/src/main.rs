@@ -181,6 +181,14 @@ struct Args {
     #[arg(long)]
     cleanup_only: bool,
 
+    /// Threads to use within each per-file codec (gzip via gzp, zstd via
+    /// libzstd). 0 (default) = auto-divide available cores across rayon
+    /// workers so total active threads stay near `nproc` instead of
+    /// `nproc²`. Set explicitly if you have a specific reason; otherwise
+    /// leave at 0.
+    #[arg(long, default_value_t = 0)]
+    codec_threads: usize,
+
     /// Verbose output.
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -201,7 +209,7 @@ impl Args {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     let roots: Vec<PathBuf> = args.inputs.clone();
     if roots.is_empty() {
@@ -242,6 +250,27 @@ fn main() -> Result<()> {
 
     if pairs.is_empty() {
         bail!("no .edf / .edf.gz / .edf.zst files found");
+    }
+
+    // Auto-divide cores between rayon workers (one per file in flight) and
+    // codec threads (gzp / zstd-mt inside each worker), so total active
+    // threads stay near `nproc` rather than `nproc²`. Without this, on a
+    // 64-core box every rayon worker spawns 64 codec threads => ~4096
+    // threads contending => severe thrashing and OOM kills on large PSGs.
+    if args.codec_threads == 0 {
+        let cpus = num_cpus();
+        let effective_workers = if args.jobs > 0 {
+            args.jobs.min(pairs.len().max(1))
+        } else {
+            cpus.min(pairs.len().max(1))
+        };
+        args.codec_threads = (cpus / effective_workers.max(1)).max(1);
+        if args.verbose {
+            println!(
+                "thread budget: {} cores / {} rayon workers => {} codec threads each",
+                cpus, effective_workers, args.codec_threads
+            );
+        }
     }
 
     // Single-file shortcut: exactly one input file, --out points at a file
@@ -1087,7 +1116,7 @@ fn write_output(path: &Path, hdr: &edf::Header, data: &[Vec<i16>], args: &Args) 
                 use gzp::ZWriter;
                 let lvl = GzpCompression::new(args.gzip_level);
                 let mut w = ParCompressBuilder::<Gzip>::new()
-                    .num_threads(num_cpus().max(1))
+                    .num_threads(args.codec_threads.max(1))
                     .map_err(|e| anyhow!("gzp num_threads: {e:?}"))?
                     .compression_level(lvl)
                     .from_writer(f);
@@ -1097,7 +1126,7 @@ fn write_output(path: &Path, hdr: &edf::Header, data: &[Vec<i16>], args: &Args) 
             }
             Compress::Zstd => {
                 let mut enc = zstd::stream::write::Encoder::new(f, args.zstd_level)?;
-                enc.multithread(num_cpus().max(1) as u32).ok();
+                enc.multithread(args.codec_threads.max(1) as u32).ok();
                 let mut w = enc.auto_finish();
                 edf::write_header(&mut w, hdr)?;
                 edf::write_data(&mut w, hdr, data)?;
