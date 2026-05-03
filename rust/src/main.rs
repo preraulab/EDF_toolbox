@@ -68,6 +68,22 @@ enum StickyPrompt {
     NoAll,
 }
 
+/// Policy for deleting source EDFs after a successful convert (or, in
+/// `--cleanup-only` mode, after confirming an output already exists).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum DeletePolicy {
+    /// Default: keep every source. No deletion happens.
+    Never,
+    /// Verify the output decompresses cleanly, then prompt
+    /// [y]es / [n]o / [A]ll / [N]one before deleting each source.
+    Ask,
+    /// Verify the output decompresses cleanly, then delete silently.
+    Silent,
+    /// Skip verification AND prompt; delete after a successful rename.
+    /// Fastest, useful only for trusted pipelines.
+    Force,
+}
+
 #[derive(Parser, Debug)]
 #[command(version, about = "Resample and rewrite EDF files")]
 #[command(group = ArgGroup::new("clobber").multiple(false).args(["interactive", "force", "no_clobber"]))]
@@ -147,6 +163,24 @@ struct Args {
     #[arg(short = 'n', long)]
     no_clobber: bool,
 
+    /// Delete each source EDF after the convert successfully writes its
+    /// compressed sibling. Modes:
+    ///   never   — keep every source (default)
+    ///   ask     — verify the output decompresses, then prompt y/n/A/N
+    ///   silent  — verify the output decompresses, then delete silently
+    ///   force   — skip verification AND prompt; delete after rename
+    /// `ask` falls back to skip-and-warn if stdin is not a terminal.
+    #[arg(long, value_enum, default_value_t = DeletePolicy::Never)]
+    delete_source: DeletePolicy,
+
+    /// Skip the conversion step entirely. For each input, if its expected
+    /// output (`<stem>_<rate>Hz.edf.{gz,zst}`) already exists, apply the
+    /// `--delete-source` policy to the source. Useful for finishing
+    /// disk-cleanup after a previous run completed without
+    /// `--delete-source`. Requires `--delete-source` not be `never`.
+    #[arg(long)]
+    cleanup_only: bool,
+
     /// Verbose output.
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -188,6 +222,15 @@ fn main() -> Result<()> {
     // Sticky decision shared across rayon workers for `-i` interactive mode.
     let prompt_state = Mutex::new(StickyPrompt::Undecided);
 
+    let delete_policy = args.delete_source;
+    let delete_prompt_state = Mutex::new(StickyPrompt::Undecided);
+    if args.cleanup_only && delete_policy == DeletePolicy::Never {
+        bail!(
+            "--cleanup-only requires --delete-source <ask|silent|force>; without a delete \
+             policy, cleanup-only mode would walk the tree and do nothing"
+        );
+    }
+
     // Collect (top_root, file_path) so we can mirror the source tree.
     // top_root is the user-supplied path under which file_path was found;
     // for a single file argument, top_root is the file's parent directory.
@@ -209,6 +252,14 @@ fn main() -> Result<()> {
             let is_dir = out.is_dir() || roots.iter().any(|r| r.is_dir());
             if !is_dir {
                 let (_root, input) = &pairs[0];
+                if args.cleanup_only {
+                    if out.exists() {
+                        check_delete(input, out, delete_policy, &delete_prompt_state, args.verbose)?;
+                    } else if args.verbose {
+                        eprintln!("[cleanup-skip] {}: no output at {}", input.display(), out.display());
+                    }
+                    return Ok(());
+                }
                 if !check_clobber(out, clobber, &prompt_state, args.verbose) {
                     return Ok(());
                 }
@@ -218,12 +269,21 @@ fn main() -> Result<()> {
                     println!("{} -> {} in {:.2}s", input.display(), out.display(),
                              t0.elapsed().as_secs_f64());
                 }
+                check_delete(input, out, delete_policy, &delete_prompt_state, args.verbose)?;
                 return Ok(());
             }
         } else {
             // No --out and one file: write next to the input.
             let (_root, input) = &pairs[0];
             let out = default_output_path(input, args.target_rate, args.compress);
+            if args.cleanup_only {
+                if out.exists() {
+                    check_delete(input, &out, delete_policy, &delete_prompt_state, args.verbose)?;
+                } else if args.verbose {
+                    eprintln!("[cleanup-skip] {}: no output at {}", input.display(), out.display());
+                }
+                return Ok(());
+            }
             if !check_clobber(&out, clobber, &prompt_state, args.verbose) {
                 return Ok(());
             }
@@ -233,6 +293,7 @@ fn main() -> Result<()> {
                 println!("{} -> {} in {:.2}s", input.display(), out.display(),
                          t0.elapsed().as_secs_f64());
             }
+            check_delete(input, &out, delete_policy, &delete_prompt_state, args.verbose)?;
             return Ok(());
         }
     }
@@ -258,8 +319,21 @@ fn main() -> Result<()> {
         Some(d)                 => format!("--out {} (mirrored)", d.display()),
         None                    => "in-situ (writing next to each input)".to_string(),
     };
-    println!("convert_edf: {} files, target {} Hz, {}",
-             pairs.len(), args.target_rate, mode_msg);
+    if args.cleanup_only {
+        println!(
+            "convert_edf: {} inputs, target {} Hz, {} -- cleanup-only ({})",
+            pairs.len(), args.target_rate, mode_msg,
+            match delete_policy {
+                DeletePolicy::Ask => "verify+prompt",
+                DeletePolicy::Silent => "verify+silent",
+                DeletePolicy::Force => "no-verify+silent",
+                DeletePolicy::Never => unreachable!(),  // bailed earlier
+            }
+        );
+    } else {
+        println!("convert_edf: {} files, target {} Hz, {}",
+                 pairs.len(), args.target_rate, mode_msg);
+    }
 
     let n = pairs.len();
     let t0 = Instant::now();
@@ -267,9 +341,11 @@ fn main() -> Result<()> {
     // finishes. With many rayon workers, file completions arrive out of
     // order; this counter is the user-visible "N of total done" tally.
     let done = std::sync::atomic::AtomicUsize::new(0);
+    // Sources actually deleted across the run (Inline + cleanup-only).
+    let deleted = std::sync::atomic::AtomicUsize::new(0);
     // Approximate ETA from the wall time so far. Cheap and good enough.
-    // Outcome value: Ok(Some(secs)) = converted, Ok(None) = skipped (existed),
-    // Err = failed.
+    // Outcome value: Ok(Some(secs)) = converted (or, in cleanup-only, the
+    // source was deleted), Ok(None) = skipped, Err = failed.
     let outcomes: Vec<(PathBuf, Result<Option<f64>>)> = pairs
         .par_iter()
         .map(|(root, input)| {
@@ -277,55 +353,102 @@ fn main() -> Result<()> {
                 Some(d) => mirror_out_path(root, input, d, args.target_rate, args.compress, args.flatten),
                 None    => default_output_path(input, args.target_rate, args.compress),
             };
-            // Ensure parent dir of `out` exists (mirrored subdirs).
-            if let Some(parent) = out.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+
+            // Cleanup-only branch: don't convert, just check whether the
+            // expected output is already there and apply delete policy.
+            if args.cleanup_only {
+                let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if !out.exists() {
+                    if args.verbose {
+                        println!("[{}/{}] cleanup-skip {}: no output at {}",
+                                 i, n, input.display(), out.display());
+                        std::io::stdout().flush().ok();
+                    }
+                    return (input.clone(), Ok(None));
+                }
+                match check_delete(input, &out, delete_policy, &delete_prompt_state, false) {
+                    Ok(true) => {
+                        deleted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if args.verbose {
+                            println!("[{}/{}] cleanup-deleted {}", i, n, input.display());
+                            std::io::stdout().flush().ok();
+                        }
+                        (input.clone(), Ok(Some(0.0)))
+                    }
+                    Ok(false) => {
+                        if args.verbose {
+                            println!("[{}/{}] cleanup-kept {}", i, n, input.display());
+                            std::io::stdout().flush().ok();
+                        }
+                        (input.clone(), Ok(None))
+                    }
+                    Err(e) => {
+                        if args.verbose {
+                            println!("[{}/{}] cleanup-fail {}: {:#}", i, n, input.display(), e);
+                            std::io::stdout().flush().ok();
+                        }
+                        (input.clone(), Err(e))
+                    }
+                }
+            } else {
+                // Normal convert path.
+                // Ensure parent dir of `out` exists (mirrored subdirs).
+                if let Some(parent) = out.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if args.verbose {
+                            println!("[{}/{}] fail {}: creating {}: {}",
+                                     i, n, input.display(), parent.display(), e);
+                        }
+                        return (input.clone(),
+                            Err(anyhow!("creating {}: {}", parent.display(), e)));
+                    }
+                }
+                // Honor the configured clobber policy. For `-i` (Prompt) the
+                // mutex inside check_clobber serializes prompts across workers.
+                if !check_clobber(&out, clobber, &prompt_state, args.verbose) {
                     let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if args.verbose {
-                        println!("[{}/{}] fail {}: creating {}: {}",
-                                 i, n, input.display(), parent.display(), e);
+                        println!("[{}/{}] skip {} (output exists)", i, n, out.display());
+                        std::io::stdout().flush().ok();
                     }
-                    return (input.clone(),
-                        Err(anyhow!("creating {}: {}", parent.display(), e)));
+                    return (input.clone(), Ok(None));
                 }
-            }
-            // Honor the configured clobber policy. For `-i` (Prompt) the
-            // mutex inside check_clobber serializes prompts across workers.
-            if !check_clobber(&out, clobber, &prompt_state, args.verbose) {
+                let t1 = Instant::now();
+                let result = match convert_one_quiet(input, &out, &args) {
+                    Ok(()) => Ok(Some(t1.elapsed().as_secs_f64())),
+                    Err(e) => Err(e),
+                };
+                // On a successful convert, optionally delete the source.
+                if let Ok(Some(_)) = &result {
+                    if let Ok(true) = check_delete(input, &out, delete_policy, &delete_prompt_state, false) {
+                        deleted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if args.verbose {
-                    println!("[{}/{}] skip {} (output exists)", i, n, out.display());
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    // ETA: extrapolate from completed/elapsed. Avoid div-by-zero.
+                    let eta = if i > 0 && i < n {
+                        let per = elapsed / i as f64;
+                        per * (n - i) as f64
+                    } else { 0.0 };
+                    match &result {
+                        Ok(Some(secs)) => println!(
+                            "[{}/{}] ok   {} ({:.2}s) | elapsed {:.0}s, ETA {:.0}s",
+                            i, n, input.display(), secs, elapsed, eta),
+                        Ok(None) => {} // skip already announced above
+                        Err(e) => println!(
+                            "[{}/{}] fail {}: {:#}", i, n, input.display(), e),
+                    }
                     std::io::stdout().flush().ok();
                 }
-                return (input.clone(), Ok(None));
+                (input.clone(), result)
             }
-            let t1 = Instant::now();
-            let result = match convert_one_quiet(input, &out, &args) {
-                Ok(()) => Ok(Some(t1.elapsed().as_secs_f64())),
-                Err(e) => Err(e),
-            };
-            let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if args.verbose {
-                let elapsed = t0.elapsed().as_secs_f64();
-                // ETA: extrapolate from completed/elapsed. Avoid div-by-zero.
-                let eta = if i > 0 && i < n {
-                    let per = elapsed / i as f64;
-                    per * (n - i) as f64
-                } else { 0.0 };
-                match &result {
-                    Ok(Some(secs)) => println!(
-                        "[{}/{}] ok   {} ({:.2}s) | elapsed {:.0}s, ETA {:.0}s",
-                        i, n, input.display(), secs, elapsed, eta),
-                    Ok(None) => {} // skip already announced above
-                    Err(e) => println!(
-                        "[{}/{}] fail {}: {:#}", i, n, input.display(), e),
-                }
-                std::io::stdout().flush().ok();
-            }
-            (input.clone(), result)
         })
         .collect();
     let total = t0.elapsed().as_secs_f64();
+    let total_deleted = deleted.load(std::sync::atomic::Ordering::Relaxed);
 
     let mut ok = 0usize;
     let mut skipped = 0usize;
@@ -340,17 +463,20 @@ fn main() -> Result<()> {
         }
     }
     let failed = n - ok - skipped;
+    let mut parts: Vec<String> = vec![format!("{}/{} ok", ok, n)];
     if skipped > 0 {
-        println!(
-            "done: {}/{} ok, {} skipped, {} failed in {:.1}s wall ({:.2} files/s)",
-            ok, n, skipped, failed, total, n as f64 / total
-        );
-    } else {
-        println!(
-            "done: {}/{} ok in {:.1}s wall ({:.2} files/s)",
-            ok, n, total, n as f64 / total
-        );
+        parts.push(format!("{} skipped", skipped));
     }
+    if failed > 0 {
+        parts.push(format!("{} failed", failed));
+    }
+    if total_deleted > 0 || delete_policy != DeletePolicy::Never {
+        parts.push(format!("{} sources deleted", total_deleted));
+    }
+    println!(
+        "done: {} in {:.1}s wall ({:.2} files/s)",
+        parts.join(", "), total, n as f64 / total
+    );
     if failed > 0 {
         std::process::exit(1);
     }
@@ -624,6 +750,134 @@ fn check_clobber(
             }
         }
     }
+}
+
+/// Decompress `path` end-to-end into `io::sink()` to confirm the codec
+/// trailer (CRC + length for gzip; frame end + checksum for zstd) is
+/// well-formed. A truncated / corrupt file -- e.g. the half-baked output
+/// of an earlier kill-9 -- raises an error here, which then *blocks* the
+/// matching source from being deleted.
+///
+/// Cheap because the read is decompress-only; nothing is written to disk.
+/// Plain `.edf` (no compression) needs no integrity check beyond
+/// existence -- nothing to verify.
+fn verify_output(path: &Path) -> Result<()> {
+    use std::io;
+    let codec = compress_from_path(path).unwrap_or(Compress::None);
+    let f = std::fs::File::open(path)
+        .with_context(|| format!("opening {} for verify", path.display()))?;
+    match codec {
+        Compress::None => Ok(()),
+        Compress::Gzip => {
+            let mut dec = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(f));
+            io::copy(&mut dec, &mut io::sink())
+                .with_context(|| format!("verify gunzip {}", path.display()))?;
+            Ok(())
+        }
+        Compress::Zstd => {
+            let mut dec = zstd::stream::read::Decoder::new(f)
+                .with_context(|| format!("creating zstd decoder for {}", path.display()))?;
+            io::copy(&mut dec, &mut io::sink())
+                .with_context(|| format!("verify zstd {}", path.display()))?;
+            Ok(())
+        }
+    }
+}
+
+/// Decide whether to delete `input` given the configured `DeletePolicy`
+/// and the just-written or pre-existing `output`. Returns Ok(true) if the
+/// source was deleted, Ok(false) if it was kept (either by policy, by
+/// failed verify, or by user prompt).
+///
+/// Mirrors `check_clobber`: the `prompt_state` mutex serializes prompts
+/// across rayon workers and tracks sticky All / None decisions.
+///
+/// Safety belt: refuses to delete if `input` and `output` canonicalize
+/// to the same path (would happen only if a future caller passes
+/// `-o <input>` -- but the check is one syscall so it's free insurance).
+fn check_delete(
+    input: &Path,
+    output: &Path,
+    policy: DeletePolicy,
+    prompt_state: &Mutex<StickyPrompt>,
+    verbose: bool,
+) -> Result<bool> {
+    if policy == DeletePolicy::Never {
+        return Ok(false);
+    }
+    // Same-path safety belt.
+    if let (Ok(a), Ok(b)) = (
+        std::fs::canonicalize(input),
+        std::fs::canonicalize(output),
+    ) {
+        if a == b {
+            eprintln!(
+                "[skip-delete] refusing to delete {}: input and output canonicalize to the same path",
+                input.display()
+            );
+            return Ok(false);
+        }
+    }
+    // Verification step (skipped only for Force).
+    if policy != DeletePolicy::Force {
+        if let Err(e) = verify_output(output) {
+            eprintln!(
+                "[skip-delete] {}: output {} failed integrity check: {:#}",
+                input.display(),
+                output.display(),
+                e
+            );
+            return Ok(false);
+        }
+    }
+    // Prompt branch (Ask only).
+    if policy == DeletePolicy::Ask {
+        let mut sticky = prompt_state.lock().unwrap();
+        let go = match *sticky {
+            StickyPrompt::YesAll => true,
+            StickyPrompt::NoAll => false,
+            StickyPrompt::Undecided => {
+                if !std::io::stdin().is_terminal() {
+                    eprintln!(
+                        "[skip-delete] {} (--delete-source ask requires a tty; non-interactive run)",
+                        input.display()
+                    );
+                    return Ok(false);
+                }
+                print!(
+                    "delete source '{}'? [y]es / [n]o / [A]ll / [N]one: ",
+                    input.display()
+                );
+                std::io::stdout().flush().ok();
+                let mut buf = String::new();
+                if std::io::stdin().lock().read_line(&mut buf).is_err() {
+                    return Ok(false);
+                }
+                match buf.trim() {
+                    "y" | "Y" | "yes" => true,
+                    "A" | "all" => {
+                        *sticky = StickyPrompt::YesAll;
+                        true
+                    }
+                    "N" | "none" => {
+                        *sticky = StickyPrompt::NoAll;
+                        false
+                    }
+                    _ => false,
+                }
+            }
+        };
+        if !go {
+            return Ok(false);
+        }
+    }
+    // Do the delete.
+    std::fs::remove_file(input)
+        .with_context(|| format!("deleting source {}", input.display()))?;
+    if verbose {
+        eprintln!("[deleted] {}", input.display());
+    }
+    Ok(true)
 }
 
 fn convert_one(input: &Path, output: &Path, args: &Args) -> Result<()> {

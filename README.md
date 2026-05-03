@@ -353,6 +353,32 @@ If `-i` is used without a tty (piped, batch job, etc.) it falls back to skip-and
 
 **Atomic writes.** All output is written to `<name>.partial` and atomically renamed to the final path on success. A Ctrl-C / SIGKILL / power-loss mid-write leaves only the `.partial` sibling — the final filename either does not exist or still holds the previous good copy. A subsequent re-run overwrites the orphan `.partial` and produces a fresh output. This means an existing final file is *always* a complete file (passes `gunzip -t` / `zstd -t`); you only need to worry about a partially-written file if you see a leftover `*.partial` in the tree.
 
+**Deleting source EDFs.** Two flags control whether originals are removed after their compressed sibling is written. They are orthogonal: `--delete-source` chooses the *policy*, `--cleanup-only` chooses the *timing*.
+
+`--delete-source <MODE>` modes:
+
+| Mode | Verify? | Prompt? | Behavior |
+|---|---|---|---|
+| `never` (default) | n/a | n/a | Keep every source. |
+| `ask` | yes | yes | Decompress the output end-to-end; if clean, prompt `[y]es / [n]o / [A]ll / [N]one` per source. Falls back to skip-and-warn without a tty. |
+| `silent` | yes | no | Verify, then delete silently. |
+| `force` | no | no | Skip the verify; delete immediately after the rename. Fastest, useful for trusted pipelines. |
+
+`--cleanup-only` skips the conversion step entirely; for each input, if its expected output (`<stem>_<rate>Hz.edf.{gz,zst}`) is already on disk, the `--delete-source` policy is applied to the source. Useful for finishing disk cleanup after an earlier run completed without `--delete-source`.
+
+```sh
+# Compress + delete-as-you-go (most common — verify each output, no prompt):
+convert_edf -F 100 -R --delete-source silent /data
+
+# Compress + per-file confirm:
+convert_edf -F 100 -R --delete-source ask /data
+
+# Just sweep delete now — outputs already exist from a previous run:
+convert_edf -F 100 -R --cleanup-only --delete-source silent /data
+```
+
+Verification is in-process (`flate2` for gzip, `zstd` crate for zstd) — no shelling out to `gunzip -t` / `zstd -t` — so a failed integrity check on the output reliably blocks the matching source from being deleted in any mode except `force`.
+
 Notes:
 - Output paths and extensions: `-o FILE` (single-file mode) always wins regardless of `--compress`. In multi-file mode `-o` must be a directory; omit it to write in-situ next to each input. The codec flag drives the extension on every output.
 - Hidden files and directories (names starting with `.`) are skipped — no surprise pickups of `.DS_Store`, `.git`, etc.
