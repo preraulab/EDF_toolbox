@@ -10,33 +10,211 @@ function varargout = read_EDF(edf_fname, varargin)
 %   conversion), and EDF+ annotations.
 %
 %   Usage:
-%       [header, signal_header, signal_cell, annotations] = read_EDF(filename, 'Channels', {'EEG Fpz-Cz'})
+%       [header, signal_header, signal_cell, annotations] = ...
+%           read_EDF(filename, 'Channels', {'EEG Fpz-Cz'})
 %
 %   Inputs:
-%       edf_fname      : string - path to a .edf or .edf.gz file
-%       'Channels'     : cell array - subset of channels to read (default: all)
-%                        Use 'ChA-ChB' to load ChA minus ChB as a rereferenced channel.
-%       'Epochs'       : 1x2 vector [start_epoch end_epoch] (0-indexed, default: all)
-%       'Verbose'      : logical - print progress and status info (default: false)
-%       'RepairHeader' : logical - correct invalid record counts and save with _fixed suffix
-%                        (default: false; ignored with a warning for .gz inputs)
-%       'forceMATLAB'  : logical - disable MEX usage (default: false). For .gz inputs
-%                        the MATLAB path decompresses to a temp file (auto-cleaned up).
-%       'debug'        : logical - debug mode for MEX (default: false)
-%       'deidentify'   : logical - overwrite PHI fields and save with _deidentified suffix
-%                        (default: false; ignored with a warning for .gz inputs)
+%       edf_fname      : string - path to a .edf, .edf.gz, or .edf.zst file
+%       'Channels'     : cell array of strings - which channels to emit
+%                        (default {} = all). Each entry is parsed as
+%                        either a passthrough label or an expression
+%                        (see "Re-referencing on load" below).
+%       'References'   : cell array of 'NAME = expr' strings (default {}).
+%                        Defines named mean / linear-combination signals
+%                        once, then makes the name usable inside any
+%                        later 'References' or 'Channels' spec. Evaluated
+%                        in declared order, so a later reference can
+%                        build on an earlier one. References that are
+%                        not also listed in 'Channels' are dropped from
+%                        the returned outputs (they exist purely to
+%                        support derivations).
+%       'Epochs'       : 1x2 vector [start_epoch end_epoch] (0-indexed,
+%                        default: all)
+%       'Verbose'      : logical - print progress / status (default false)
+%       'RepairHeader' : logical - correct an invalid num_data_records
+%                        in the file header and save a '_fixed' copy
+%                        (default false; ignored with a warning for
+%                        compressed inputs).
+%       'forceMATLAB'  : logical - disable the MEX backend and use the
+%                        pure-MATLAB reader (default false). Compressed
+%                        inputs are decompressed to a temp file in this
+%                        path and auto-cleaned-up on return.
+%       'debug'        : logical - debug mode for MEX (default false)
+%       'deidentify'   : logical - blank PHI fields and save a
+%                        '_deidentified' copy (default false; ignored
+%                        with a warning for compressed inputs).
 %
 %   Outputs:
-%       header        : structure containing EDF file-level metadata
-%       signal_header : structure array of per-signal headers
-%       signal_cell   : cell array containing each signal vector (in physical units)
-%       annotations   : structure array of EDF+ annotations with onset and text
+%       header        : struct of EDF file-level metadata
+%       signal_header : struct array of per-signal headers
+%       signal_cell   : cell array, one signal vector per channel,
+%                       in physical units (scaled and offset)
+%       annotations   : struct array of EDF+ annotations
 %
-%   Examples:
-%       % Plain EDF
-%       [hdr, shdr, sc, ann] = read_EDF('sleep.edf', 'Channels', {'EEG C3-A2'});
+%   -------------------------------------------------------------------------
+%   Re-referencing on load
 %
-%       % Gzip-compressed EDF (streamed via zlib, no temp file)
+%   Each 'Channels' entry resolves in this order:
+%
+%     1. Direct-match-wins: the trimmed, case-insensitive entry is
+%        compared against the augmented label set (real EDF labels +
+%        any References defined). On match, that channel is emitted
+%        verbatim. This is what protects EDF labels that themselves
+%        contain operator characters — '[C3-A2 - B]', 'EEG C3-A2',
+%        'C1 - A2', etc. — from being mis-parsed as expressions.
+%
+%     2. Otherwise the entry is parsed as an expression in this small
+%        grammar (whitespace anywhere outside labels is ignored):
+%
+%            spec     := [name '='] expr
+%            expr     := [sign] term (sign term)*
+%            term     := name | mean '(' name (',' name)+ ')'
+%            sign     := '+' | '-'
+%            name     := '$' anything '$'                  | (escape-quoted)
+%                        longest case-insensitive prefix    | (bare)
+%                        match against the augmented label set
+%
+%        The optional 'name =' prefix sets the output channel's label
+%        (alias). Without it the output label is the raw spec string
+%        (matches the behavior of 'C3-A2'). Aliases are mandatory for
+%        References — the whole point is to bind a name.
+%
+%     3. mean(c1, ..., cN) requires N >= 2 and produces an inline
+%        equal-weight mean; coefficients (1/N) are flattened into the
+%        final linear combination at parse time.
+%
+%   Examples (each comment is the equivalent math):
+%
+%       % Inline linked-mastoid                  C3 - (A1+A2)/2
+%       'C3 - mean(A1, A2)'
+%
+%       % Same, but bind a reusable name first
+%       'References', {'LM = mean(A1, A2)'}, ...
+%       'Channels',   {'C3-LM', 'C4-LM', 'Fpz_LM = -LM'}
+%
+%       % Sum of two channels                    A1 + A2
+%       'A1 + A2'
+%
+%       % Reference building on a reference
+%       'References', {'M = mean(A1,A2)', 'R = C3 - M'}, ...
+%       'Channels',   {'R'}                            % emits C3 - M
+%
+%   -------------------------------------------------------------------------
+%   Resolution: how a spec becomes a signal
+%
+%   Every 'Channels' and 'References' spec is preprocessed before
+%   parsing. A single greedy longest-match pass walks the augmented
+%   label set (real EDF labels + earlier References + earlier aliased
+%   Channels outputs) and wraps each occurrence in '$...$' tokens. The
+%   parser then sees only '$LABEL$' tokens, operators ('+', '-', ',',
+%   '(', ')', '='), and 'mean'.
+%
+%       EDF labels: {'EEG C3 - A2', 'EEG C3', 'A2', 'EMG'}
+%
+%       'EEG C3 - A2'         ->  '$EEG C3 - A2$'
+%                                 (passthrough; longest match wraps the
+%                                  whole spec)
+%       'EEG C3 - A2 - A2'    ->  '$EEG C3 - A2$ - $A2$'
+%                                 ((labeled C3-A2) minus A2; longest-
+%                                  first then leftover)
+%       'mean(EEG C3, A2)'    ->  'mean($EEG C3$, $A2$)'
+%       'OUT = EEG C3 - A2'   ->  'OUT = $EEG C3 - A2$'
+%                                 (alias name is left alone)
+%
+%   User-supplied '$...$' regions are preserved verbatim by the
+%   preprocessor, so write '$LABEL$' explicitly to override the
+%   longest-match interpretation:
+%
+%       % EDF has both 'EEG C3 - A2' (a recording-side reref) AND
+%       % 'EEG C3' / 'A2' as separate channels.
+%       read_EDF(f, 'Channels', {'EEG C3 - A2'})        % the labeled channel
+%       read_EDF(f, 'Channels', {'$EEG C3$ - $A2$'})    % computed difference
+%
+%   Pass 'Verbose', true to see the wrapped form for each spec — useful
+%   when you suspect a label-vs-expression collision.
+%
+%   '$LABEL$' is also the escape for labels containing characters the
+%   parser would otherwise eat ('+', ',', '(', ')', '='), labels that
+%   start with 'mean(', or labels that are substrings of others when you
+%   want to force the shorter one:
+%
+%       read_EDF(f, 'Channels', {'$EEG A+B$ - mean($A1$, $A2$)'})
+%       read_EDF(f, 'Channels', {'$mean(LF,RF)$'})           % literal label
+%       read_EDF(f, 'Channels', {'$Label = X$'})             % '=' is literal
+%       read_EDF(f, 'Channels', {'C3 - mean($A1$, $A2$)'})   % force short A1
+%
+%   -------------------------------------------------------------------------
+%   Channels chaining
+%
+%   Aliased Channels entries become reusable names for any later
+%   'Channels' entry, so multi-step derivations can be written inline:
+%
+%       'Channels', {'LM      = mean(A1, A2)', ...
+%                    'C3_LM   = C3 - LM', ...
+%                    'NewChan = C3_LM + 0.5'}
+%
+%   The difference vs 'References': aliased Channels entries are
+%   *returned* as outputs; References outputs are hidden helpers (drop
+%   out of the returned cell unless explicitly named in 'Channels').
+%   Unaliased Channels entries (no '=') don't pollute the namespace.
+%
+%   -------------------------------------------------------------------------
+%   Constraints (errors raised at validation, before any data is
+%   evaluated):
+%       read_EDF:UnknownChannel  - a leaf in an expression / reference
+%                                  doesn't resolve to a label in the
+%                                  augmented set.
+%       read_EDF:RefCollision    - a reference name collides with an
+%                                  EDF label or with an earlier
+%                                  reference (case-insensitive).
+%       read_EDF:RateMismatch    - leaves of one spec / reference span
+%                                  different sampling rates. The
+%                                  toolbox does not resample on the
+%                                  fly; resample after read_EDF or
+%                                  precompute compatible inputs.
+%       read_EDF:BadMean         - mean(...) called with fewer than
+%                                  2 arguments.
+%       read_EDF:ParseError      - malformed expression syntax (missing
+%                                  '=' in a Reference, unterminated
+%                                  '$' quote, dangling operator, ...).
+%
+%   Validation runs whenever 'References' is non-empty or any
+%   'Channels' entry contains 'mean(', '=', '+', or '$' — even if the
+%   caller ignored read_EDF's outputs. Plain labels and legacy 'A-B'
+%   strings stay on the existing fast backend (MEX or MATLAB) and are
+%   bit-identical to prior versions.
+%
+%   -------------------------------------------------------------------------
+%   Examples (full call sites):
+%
+%       % Plain EDF, all channels
+%       [hdr, shdr, sc, ann] = read_EDF('sleep.edf');
+%
+%       % Subset by label, with a legacy A-B reref
+%       [~, ~, sc] = read_EDF('sleep.edf', ...
+%           'Channels', {'EEG C3-A2', 'EEG O2-A1'});
+%
+%       % Linked-mastoid via inline mean()
+%       [~, ~, sc] = read_EDF('sleep.edf', ...
+%           'Channels', {'C3 - mean(A1, A2)'});
+%
+%       % Linked-mastoid via a named reference reused across channels
+%       [~, ~, sc] = read_EDF('sleep.edf', ...
+%           'References', {'LM = mean(A1, A2)'}, ...
+%           'Channels',   {'C3-LM', 'C4-LM', '-LM'});
+%
+%       % EDF where a label has a '+' in it (e.g. 'EEG A+B'). Bare
+%       % 'EEG A+B' would be parsed as 'EEG A' + 'B' -- escape it:
+%       [~, ~, sc] = read_EDF('weird.edf', ...
+%           'Channels', {'$EEG A+B$ - mean($A1$, $A2$)'});
+%
+%       % EDF that has both 'C1', 'A2', AND a labeled 'C1-A2' channel.
+%       % Bare 'C1-A2' returns the labeled channel; '$C1$-$A2$' forces
+%       % the computed difference of the raw channels.
+%       [~, ~, sc_labeled]  = read_EDF('overlap.edf', 'Channels', {'C1-A2'});
+%       [~, ~, sc_computed] = read_EDF('overlap.edf', 'Channels', {'$C1$-$A2$'});
+%
+%       % Compressed input (streamed via zlib, no temp file in MEX path)
 %       [hdr, shdr, sc, ann] = read_EDF('sleep.edf.gz');
 %
 %   -------------------------------------------------------------------------
@@ -72,6 +250,7 @@ end
 
 p = inputParser;
 addParameter(p, 'Channels', {}, @iscell);
+addParameter(p, 'References', {}, @iscell);
 addParameter(p, 'Epochs', [], @isnumeric);
 addParameter(p, 'Verbose', false, @islogical);
 addParameter(p, 'RepairHeader', false, @islogical);
@@ -81,12 +260,28 @@ addParameter(p, 'deidentify', false, @islogical);
 parse(p, varargin{:});
 
 channels        = p.Results.Channels;
+references      = p.Results.References;
 epochs          = p.Results.Epochs;
 verbose         = p.Results.Verbose;
 repair_header   = p.Results.RepairHeader;
 force_matlab    = p.Results.forceMATLAB;
 debug           = p.Results.debug;
 deidentify      = p.Results.deidentify;
+
+% Decide whether to route through the derived-channels post-processing
+% layer. The legacy backend (MEX in C, or read_EDF_matlab in this file)
+% understands plain labels and 'A-B' rereference strings; nothing richer.
+% So whenever the caller used new syntax (References, mean(), aliasing,
+% '+' sums, or '$...$' escape-quoted labels), we ask the backend for
+% EVERY channel via Channels = {} and filter / derive after it returns.
+% The trade-off is decoding signals the user may not need -- acceptable
+% for typical PSG layouts (8-30 channels) but worth knowing about for
+% high-density EEG. See has_derived_syntax for the detector.
+use_derived_pipeline = ~isempty(references) || has_derived_syntax(channels);
+backend_channels     = channels;
+if use_derived_pipeline
+    backend_channels = {};
+end
 
 %% ---------------- COMPRESSED INPUT GATING ----------------
 % RepairHeader and deidentify both require modifying the file in place,
@@ -113,14 +308,27 @@ script_dir = fileparts(mfilename('fullpath'));
 mex_file = fullfile(script_dir, ['read_EDF_mex.' mexext]);
 mex_exists = isfile(mex_file);
 
+% When the derived pipeline is active, validation and evaluation need
+% (header, signal_header, signal_cell) regardless of how many outputs
+% the caller asked for. Bumping backend_nargout up to 3 ensures that
+% even a `read_EDF(f, 'Channels', {...})` call with no LHS captures
+% will still raise UnknownChannel / RateMismatch / etc. on bad input.
+% At the very end we trim varargout back down to the caller's nargout
+% so the MATLAB return semantics are unchanged.
+backend_nargout = nargout;
+if use_derived_pipeline
+    backend_nargout = max(nargout, 3);
+end
+
+mex_succeeded = false;
 if ~force_matlab
     if ~mex_exists
         compile_edf_mex(script_dir, 'read_EDF_mex.c');
     end
     try
-        [varargout{1:nargout}] = read_EDF_mex(edf_fname, channels, epochs, verbose, repair_header, debug);
+        [varargout{1:backend_nargout}] = read_EDF_mex(edf_fname, backend_channels, epochs, verbose, repair_header, debug);
 
-        if nargout>0
+        if backend_nargout>0
             %Add the total data in seconds
             total_seconds = varargout{1}.num_data_records * varargout{1}.data_record_duration;
             varargout{1}.total_data_seconds = total_seconds;
@@ -128,22 +336,17 @@ if ~force_matlab
         end
 
         %Remove the whitespace around the labels
-        if nargout>1
+        if backend_nargout>1
             new_signal_labels = cellfun(@strip,{varargout{2}.signal_labels},'UniformOutput', false);
             [varargout{2}.signal_labels] = deal(new_signal_labels{:});
         end
 
-        % Deidentify post-MEX if requested (MEX does not handle this)
-        if deidentify
-            deidentify_edf(edf_fname, repair_header, verbose);
-        end
-        return
+        mex_succeeded = true;
     catch ME
         if verbose
             fprintf('MEX failed (%s). Falling back to MATLAB reader.\n', ME.message);
         end
     end
-
 else
     if verbose
         fprintf('forceMATLAB = true, using MATLAB reader.\n');
@@ -151,7 +354,38 @@ else
 end
 
 %% ---------------- MATLAB FALLBACK ----------------
-[varargout{1:nargout}] = read_EDF_matlab(edf_fname, channels, epochs, verbose, repair_header, deidentify);
+if ~mex_succeeded
+    [varargout{1:backend_nargout}] = read_EDF_matlab(edf_fname, backend_channels, epochs, verbose, repair_header, deidentify);
+end
+
+%% ---------------- DERIVED PIPELINE (post-load) ----------------
+% Both backends produced (header, signal_header, signal_cell) for the
+% full channel set; this layer applies References and 'Channels'
+% expressions identically regardless of which backend ran. It's
+% deliberately OUTSIDE the MEX try/catch so a validation error
+% (UnknownChannel, RateMismatch, RefCollision, BadMean, ParseError)
+% propagates to the caller instead of triggering a silent fallback to
+% the MATLAB reader, which would just hit the same error a moment
+% later anyway.
+if use_derived_pipeline
+    [varargout{2}, varargout{3}] = ...
+        apply_channel_derivations(varargout{2}, varargout{3}, channels, references, verbose);
+end
+
+%% ---------------- DEIDENTIFY (post-MEX only) ----------------
+% deidentify modifies the file on disk; only meaningful when the MEX
+% backend succeeded (the MATLAB fallback already handles it inline).
+if mex_succeeded && deidentify
+    deidentify_edf(edf_fname, repair_header, verbose);
+end
+
+% Restore the caller's nargout. backend_nargout may have been bumped
+% above to make sh / sc available to the derived pipeline; trim off
+% anything the caller didn't ask for so the function's apparent
+% multiple-return signature matches MATLAB's expectations.
+if numel(varargout) > nargout
+    varargout = varargout(1:nargout);
+end
 
 end
 
@@ -500,6 +734,44 @@ else
 end
 sc_out = [signal_cell(plain_idx), reref_sc];
 end
+
+
+%% =========================================================================
+%  DERIVED-CHANNELS PIPELINE
+%  -----------------------------------------------------------------------
+%  Post-load layer that adds named References (mean-of-N etc.) and a small
+%  expression syntax inside 'Channels' to read_EDF without touching the
+%  MEX. Activated by the public read_EDF dispatcher whenever 'References'
+%  is non-empty or any 'Channels' entry contains a marker character that
+%  the legacy backend wouldn't understand. When inactive, plain labels
+%  and legacy 'A-B' strings flow straight through the MEX (or MATLAB
+%  fallback) and the output is bit-identical to prior versions.
+%
+%  The pipeline operates on physical-units signals returned by the
+%  backend, so re-referencing math runs in float and inherits the
+%  scaling that read_EDF already applied.
+% =========================================================================
+
+function tf = has_derived_syntax(channels)
+%HAS_DERIVED_SYNTAX  Detect whether any 'Channels' entry needs the new pipeline.
+%
+%   Returns true if any string contains 'mean(' (case-insensitive), '='
+%   (alias), '+' (sum operator), or '$' (escape-quoted label). These
+%   markers are absent from plain labels and legacy 'A-B' strings — both
+%   of which the MEX / MATLAB backend handles directly — so this works
+%   as a cheap conservative gate. False positives are harmless (we'd
+%   simply route through the post-processing layer needlessly).
+tf = false;
+for k = 1:numel(channels)
+    s = lower(channels{k});
+    if contains(s, 'mean(') || contains(s, '=') || contains(s, '+') || contains(s, '$')
+        tf = true;
+        return
+    end
+end
+end
+
+
 
 
 %% =========================================================================

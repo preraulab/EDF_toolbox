@@ -52,7 +52,7 @@ cd rust && cargo build --release
 | **MEX acceleration** | Compiled C reader; pure MATLAB fallback if MEX isn't available or is disabled |
 | **Compressed input/output** | Reads and writes `.edf.gz` (zlib) and `.edf.zst` (libzstd) directly — no temp file, streaming on the fly. zstd is ~5× faster to compress than gzip-6 with smaller output and is the recommended format. |
 | **Channel subsetting** | Load only specific channels by name |
-| **A-B rereferencing** | `'EEG C3-A2'` — compute on-the-fly during load |
+| **Re-referencing on load** | `'C3-A2'` (legacy A-B), `'C3 - mean(A1,A2)'` (linked-mastoid style), `'LM = mean(A1,A2)'` named references with `'C3-LM'`, aliased outputs `'OUT = expr'`, `+`/`-` sums, `mean(...)` of N constituents |
 | **Epoch subsetting** | Load only a `[start_epoch end_epoch]` slice |
 | **EDF+ annotations** | Parse TAL (Time-Annotation List) format |
 | **Header repair** | Correct invalid `num_data_records` and save a `_fixed` copy (plain `.edf` only) |
@@ -76,14 +76,97 @@ cd rust && cargo build --release
 [~, ~, signals] = read_EDF('psg.edf', 'Channels', {'EEG C3-A2', 'EEG O2-A1', 'EOG Left-Right'});
 ```
 
-### A-B rereferencing
+### Re-referencing on load
+
+`read_EDF` accepts a small expression syntax inside `'Channels'` so you can derive new signals without round-tripping through MATLAB. Three operators: `+`, `-`, and `mean(...)`. An optional alias prefix `'OUT = expr'` sets the output channel's label.
+
+#### Legacy A-B form
 
 ```matlab
-% Rereference on load — EDF file contains both EEG C3 and EEG A2 separately
-[~, ~, s] = read_EDF('psg.edf', 'Channels', {'EEG C3-A2'});
+[~, ~, s] = read_EDF('psg.edf', 'Channels', {'C3-A2'});
 ```
 
-The reader parses `'C3-A2'`, loads both channels, subtracts, and returns a single rereferenced signal.
+Loads both `C3` and `A2`, subtracts, returns a single re-referenced signal labeled `'C3-A2'`.
+
+#### Inline `mean(...)` — linked mastoid
+
+For a recording where every channel is referenced to a single electrode (e.g., `Fpz`), and the EDF labels are `C3`, `C4`, `A1`, `A2`, you can build linked-mastoid derivations directly:
+
+```matlab
+[~, sh, sc] = read_EDF('psg.edf', 'Channels', { ...
+    'C3_LM  = C3 - mean(A1, A2)', ...
+    'C4_LM  = C4 - mean(A1, A2)', ...
+    'Fpz_LM =    -mean(A1, A2)' ...
+});
+```
+
+Each spec is parsed as a flat coefficient/leaf linear combination — `mean(A1, A2)` distributes `1/N` across each constituent.
+
+#### Named references — `'References'`
+
+If the same constituent list shows up in multiple specs, define it once via the `'References'` argument:
+
+```matlab
+[~, sh, sc] = read_EDF('psg.edf', ...
+    'References', {'LM = mean(A1, A2)'}, ...
+    'Channels',   {'C3-LM', 'C4-LM', '-LM'});
+```
+
+References are evaluated in declared order, so a reference can build on an earlier reference. Each reference becomes a name in the channel namespace; bare-reference output (`'Channels', {'LM'}`) returns the mean signal itself.
+
+A `'NAME = expr'` reference is **required** to use the alias form (the whole point is to bind a name); inside `'Channels'`, the alias is optional.
+
+#### Chaining inside `'Channels'`
+
+Aliased outputs become reusable names for any *later* `'Channels'` entry, so a multi-step derivation can be expressed inline without `'References'`:
+
+```matlab
+[~, sh, sc] = read_EDF('psg.edf', 'Channels', { ...
+    'LM       = mean(A1, A2)', ...
+    'C3_LM    = C3 - LM', ...
+    'NewChan  = C3_LM + 0.5'   % uses both the previous outputs
+});
+```
+
+The difference vs `'References'`: aliased Channels entries are *returned* as outputs; `'References'` outputs are hidden helpers (drop out of the returned cell unless asked for explicitly). Use `'References'` for intermediates the caller doesn't want to see; use chained `'Channels'` when every step is part of the result. Unaliased entries (`'C3 - A2'` with no `=`) are one-shot — they don't pollute the namespace for later specs.
+
+#### Resolution: how a spec becomes a signal
+
+Every `'Channels'` and `'References'` spec is **preprocessed** before parsing: a single greedy longest-match pass walks the augmented label set (real EDF labels + earlier References + earlier aliased outputs) and wraps each occurrence in `$...$` tokens. The parser then sees only `$LABEL$` tokens, operators (`+`, `-`, `,`, `(`, `)`, `=`), and `mean`. There is no longest-prefix matching inside the parser.
+
+```text
+EDF labels: {'EEG C3 - A2', 'EEG C3', 'A2', 'EMG'}
+
+'EEG C3 - A2'         ->  '$EEG C3 - A2$'          (passthrough; longest match wraps the whole spec)
+'EEG C3 - A2 - A2'    ->  '$EEG C3 - A2$ - $A2$'   ((labeled C3-A2) − A2; longest-first then leftover)
+'mean(EEG C3, A2)'    ->  'mean($EEG C3$, $A2$)'   (inline mean of two leaves)
+'OUT = EEG C3 - A2'   ->  'OUT = $EEG C3 - A2$'    (aliased passthrough; alias name is left alone)
+```
+
+Pass `'Verbose', true` to see exactly how each spec was wrapped — useful when you suspect a label-vs-expression collision:
+
+```matlab
+read_EDF('psg.edf', 'Channels', {'EEG C3 - A2 - A2'}, 'Verbose', true);
+% read_EDF: 'EEG C3 - A2 - A2'  ->  '$EEG C3 - A2$ - $A2$'
+```
+
+#### Forcing a computed expression when the whole string is a label
+
+If you want a *computed* difference and the EDF happens to contain a labeled channel matching the same string, write each leaf with explicit `$...$` — user-supplied `$...$` regions are left untouched by the preprocessor:
+
+```matlab
+[~, ~, s_labeled]  = read_EDF('psg.edf', 'Channels', {'EEG C3 - A2'});       % the labeled channel
+[~, ~, s_computed] = read_EDF('psg.edf', 'Channels', {'$EEG C3$ - $A2$'});   % computed difference
+```
+
+Use `$label$` whenever you want to override the longest-match interpretation, or whenever a label contains characters the parser would otherwise eat (`+`, `,`, `(`, `)`, `=`, or labels starting with `mean`).
+
+#### Constraints
+
+- All leaves of a single spec or reference must share the same sampling rate. Mismatch errors with `read_EDF:RateMismatch`.
+- Reference names cannot collide with EDF labels or with each other (case-insensitive). Collision errors with `read_EDF:RefCollision`.
+- `mean(...)` requires at least 2 arguments; a single-channel mean errors with `read_EDF:BadMean`.
+- Synthetic reference signals are dropped from the returned cell unless explicitly requested in `'Channels'`.
 
 ### Load a specific time window
 
@@ -142,9 +225,18 @@ write_EDF('out.edf.zst', h, sh, sc, ann, 'ZstdLevel', 9);       % zstd, smaller
 %            clips data to fit;
 %            'recompute' sets physical_min/max from the data (no clipping).
 write_EDF('out.edf', h, sh, sc, [], 'AutoScale', 'recompute');
+
+% Channels / References — same expression syntax as read_EDF. Selects
+% (and/or computes) which channels reach the output. AutoScale='recompute'
+% is a good default here because the derived signals' range can extend
+% beyond any single constituent's physical_min/max.
+write_EDF('out.edf', h, sh, sc, [], ...
+    'References', {'LM = mean(A1, A2)'}, ...
+    'Channels',   {'C3 - LM', 'C4 - LM'}, ...
+    'AutoScale',  'recompute');
 ```
 
-The default `'preserve'` mode is required for lossless `read → write → read` round-trip; round-tripped signals match the originals to within one digital LSB per channel. Use `'recompute'` whenever the data may exceed the existing `physical_min/max` (e.g. after resampling — see `convert_EDF` below).
+The default `'preserve'` mode is required for lossless `read → write → read` round-trip; round-tripped signals match the originals to within one digital LSB per channel. Use `'recompute'` whenever the data may exceed the existing `physical_min/max` (e.g. after resampling — see `convert_EDF` below — or after any derivation).
 
 **Compression formats.** zstd is the recommended default: roughly 5× faster to compress than gzip level 6 with similar or better ratios, and decompression is also faster. Use `.edf.gz` only when you need to hand the file to a tool that does not understand `.zst`.
 

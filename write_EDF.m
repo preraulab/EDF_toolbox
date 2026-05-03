@@ -25,6 +25,19 @@ function write_EDF(out_fname, header, signal_header, signal_cell, varargin)
 %       annotations   : Nx1 struct array of {onset, text} (optional, [] OK)
 %
 %   Name-value pairs:
+%       'Channels'    : cell array of expression strings (default {}).
+%                       Same syntax as read_EDF's 'Channels' — passthrough
+%                       labels, '+'/'-'/mean(...) expressions, aliased
+%                       outputs ('OUT = expr'), '$LABEL$' escapes, and
+%                       inline chaining via aliased outputs. When non-
+%                       empty, the derivation pipeline runs over the
+%                       provided (signal_header, signal_cell) before
+%                       writing, and only the derived channels reach
+%                       the file. See APPLY_CHANNEL_DERIVATIONS.
+%       'References'  : cell array of 'NAME = expr' strings (default {}).
+%                       Pre-baked intermediates available to 'Channels'
+%                       expressions but not written to disk unless also
+%                       listed in 'Channels'.
 %       'Verbose'     : logical (default false)
 %       'forceMATLAB' : logical (default false)
 %       'AutoScale'   : 'preserve' (default) -> keep existing physical_min/max
@@ -69,6 +82,8 @@ if ~isempty(varargin)
 end
 
 p = inputParser;
+addParameter(p, 'Channels',    {}, @iscell);
+addParameter(p, 'References',  {}, @iscell);
 addParameter(p, 'Verbose',     false, @islogical);
 addParameter(p, 'forceMATLAB', false, @islogical);
 addParameter(p, 'AutoScale',   'preserve', @(s) any(strcmpi(s, {'preserve','recompute'})));
@@ -77,6 +92,8 @@ addParameter(p, 'ZstdLevel',   9, @(x) isnumeric(x) && isscalar(x) && x >= 1 && 
 addParameter(p, 'debug',       false, @islogical);
 parse(p, varargin{:});
 
+channels     = p.Results.Channels;
+references   = p.Results.References;
 verbose      = p.Results.Verbose;
 force_matlab = p.Results.forceMATLAB;
 autoscale    = lower(p.Results.AutoScale);
@@ -108,6 +125,18 @@ for k = 1:numel(fields_to_drop)
     if isfield(header, fields_to_drop{k})
         header = rmfield(header, fields_to_drop{k});
     end
+end
+
+% Optional derivation pass: when 'Channels' or 'References' is provided,
+% transform the input (signal_header, signal_cell) using the same
+% expression syntax read_EDF accepts. Result replaces the inputs going
+% into the writer. header.num_signals is updated so the MEX/MATLAB
+% backend writes the correct per-signal header count.
+if ~isempty(channels) || ~isempty(references)
+    [signal_header, signal_cell] = apply_channel_derivations( ...
+        signal_header, signal_cell, channels, references, verbose);
+    header.num_signals = numel(signal_header);
+    header.num_header_bytes = 256 + 256 * header.num_signals;
 end
 
 %% ---------------- MEX HANDLING ----------------
