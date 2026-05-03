@@ -299,7 +299,7 @@ REMOTE=$(git ls-remote git@github.com:preraulab/EDF_toolbox.git master | cut -c1
 
 A trailing `-dirty` on the SHA means the binary was built from a working tree with uncommitted changes — likely a developer build, not a clean tagged version.
 
-Defaults — `--compress gzip --gzip-level 9`, `--auto-scale recompute`, `--jobs 0` (= all cores) — are tuned for typical PSG batches. The CLI takes one or more positional inputs that may be files or directories, mixed:
+Defaults — `--compress gzip --gzip-level 9`, `--auto-scale recompute`, `--jobs 0` (= `min(num_cpus, 8)`) — are tuned for typical PSG batches. The CLI takes one or more positional inputs that may be files or directories, mixed:
 
 ```sh
 # A single file
@@ -370,9 +370,9 @@ If `-i` is used without a tty (piped, batch job, etc.) it falls back to skip-and
 
 **Atomic writes.** All output is written to `<name>.partial` and atomically renamed to the final path on success. A Ctrl-C / SIGKILL / power-loss mid-write leaves only the `.partial` sibling — the final filename either does not exist or still holds the previous good copy. A subsequent re-run overwrites the orphan `.partial` and produces a fresh output. This means an existing final file is *always* a complete file (passes `gunzip -t` / `zstd -t`); you only need to worry about a partially-written file if you see a leftover `*.partial` in the tree.
 
-**Parallelism: `--jobs` and `--codec-threads`.** `--jobs` controls how many files are converted concurrently (default = all logical cores). Each in-flight worker also runs the codec (parallel-gzip via `gzp`, or zstd-mt) in its own thread pool. To prevent N_workers × N_cores total active threads (which on a 64-core box becomes ~4096 threads thrashing and tends to OOM-kill the process on large PSGs), the binary auto-divides cores between rayon workers and per-worker codec threads — total active threads stay near `nproc`.
+**Parallelism: `--jobs` and `--codec-threads`.** `--jobs` controls how many files are converted concurrently. The default (`--jobs 0`) is **`min(num_cpus, 8)`** — capped because each rayon worker holds an entire decoded PSG in RAM (often 1–3 GB as f32 physical units), so on a 64-core box uncapped concurrency would OOM-kill the process long before saturating CPU. Spare cores are not wasted: each in-flight worker also runs the codec (parallel-gzip via `gzp`, or zstd-mt) in its own thread pool, and the binary auto-divides leftover cores into per-worker codec threads. Total active threads stay near `nproc`.
 
-Override with `--codec-threads N` if you have a specific reason. `-v` prints the chosen budget at startup, e.g. `thread budget: 64 cores / 8 rayon workers => 8 codec threads each`. For very large EDFs on memory-constrained boxes the right knob is usually `--jobs <small>` (each rayon worker holds an entire decoded PSG in RAM); the codec thread budget then auto-adjusts to use the freed cores.
+Override `--jobs` upward if you know the files are small or the machine has plenty of RAM; downward (`--jobs 4`, `--jobs 2`) for very large PSGs on tight-memory boxes. Override `--codec-threads N` if you have a specific reason. `-v` prints the chosen budget at startup, e.g. `thread budget: 64 cores / 8 rayon workers => 8 codec threads each`.
 
 **Deleting source EDFs.** Two flags control whether originals are removed after their compressed sibling is written. They are orthogonal: `--delete-source` chooses the *policy*, `--cleanup-only` chooses the *timing*.
 

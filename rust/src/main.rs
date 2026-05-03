@@ -157,7 +157,12 @@ struct Args {
     #[arg(long, value_enum, default_value_t = AutoScale::Recompute)]
     auto_scale: AutoScale,
 
-    /// Number of parallel workers in batch mode (0 = use rayon default).
+    /// Number of parallel workers in batch mode. 0 (default) = auto:
+    /// `min(num_cpus, 8)`. The cap exists because each worker holds a full
+    /// decoded PSG in RAM (often 1-3 GB as f32), so on a 64-core box with
+    /// no cap you'd OOM long before saturating CPU. Bump explicitly only
+    /// if you know the files are small or the machine has lots of RAM.
+    /// Spare cores are absorbed into per-file codec threads automatically.
     #[arg(long, default_value_t = 0)]
     jobs: usize,
 
@@ -234,12 +239,15 @@ fn main() -> Result<()> {
         bail!("--target-rate / -F is required (or pass --read-bench to skip conversion)");
     }
 
-    if args.jobs > 0 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(args.jobs)
-            .build_global()
-            .ok();
+    // Resolve `--jobs 0` to a memory-aware default. See Args::jobs docs.
+    const DEFAULT_JOBS_CAP: usize = 8;
+    if args.jobs == 0 {
+        args.jobs = num_cpus().min(DEFAULT_JOBS_CAP).max(1);
     }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.jobs)
+        .build_global()
+        .ok();
 
     let clobber = args.clobber_policy();
     // Sticky decision shared across rayon workers for `-i` interactive mode.
@@ -274,12 +282,8 @@ fn main() -> Result<()> {
     // threads contending => severe thrashing and OOM kills on large PSGs.
     if args.codec_threads == 0 {
         let cpus = num_cpus();
-        let effective_workers = if args.jobs > 0 {
-            args.jobs.min(pairs.len().max(1))
-        } else {
-            cpus.min(pairs.len().max(1))
-        };
-        args.codec_threads = (cpus / effective_workers.max(1)).max(1);
+        let effective_workers = args.jobs.min(pairs.len().max(1)).max(1);
+        args.codec_threads = (cpus / effective_workers).max(1);
         if args.verbose {
             println!(
                 "thread budget: {} cores / {} rayon workers => {} codec threads each",
