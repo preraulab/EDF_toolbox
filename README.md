@@ -282,6 +282,23 @@ echo 'export PATH="$HOME/EDF_toolbox/rust/target/release:$PATH"' >> ~/.bashrc
 
 Once installed, drop the `./` prefix from every example below — `convert_edf -F 100 -R /data` works from anywhere.
 
+**Verifying the installed version.** `--version` reports the Cargo version plus the git SHA and date the binary was built from, e.g.
+
+```sh
+$ convert_edf --version
+convert_edf_rs 0.1.0 (d869c4d44b 2026-05-03)
+```
+
+Compare against `git ls-remote` to check whether the binary on a given cluster node is current:
+
+```sh
+INSTALLED=$(convert_edf --version | awk '{print $3}' | tr -d '(')
+REMOTE=$(git ls-remote git@github.com:preraulab/EDF_toolbox.git master | cut -c1-10)
+[ "$INSTALLED" = "$REMOTE" ] && echo "up to date" || echo "out of date — pull and cargo install --path . again"
+```
+
+A trailing `-dirty` on the SHA means the binary was built from a working tree with uncommitted changes — likely a developer build, not a clean tagged version.
+
 Defaults — `--compress gzip --gzip-level 9`, `--auto-scale recompute`, `--jobs 0` (= all cores) — are tuned for typical PSG batches. The CLI takes one or more positional inputs that may be files or directories, mixed:
 
 ```sh

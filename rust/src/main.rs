@@ -84,8 +84,23 @@ enum DeletePolicy {
     Force,
 }
 
+/// `clap`'s `--version` string. Combines the Cargo package version with
+/// the git SHA and commit date captured by `build.rs`. After this change
+/// `convert_edf --version` prints e.g.
+///     convert_edf 0.1.0 (d869c4d44b 2026-05-03)
+/// so users can compare the running binary against `git ls-remote` without
+/// having a source tree.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("GIT_SHA"),
+    " ",
+    env!("GIT_BUILD_DATE"),
+    ")"
+);
+
 #[derive(Parser, Debug)]
-#[command(version, about = "Resample and rewrite EDF files")]
+#[command(version = VERSION, about = "Resample and rewrite EDF files")]
 #[command(group = ArgGroup::new("clobber").multiple(false).args(["interactive", "force", "no_clobber"]))]
 struct Args {
     /// Input files or directories (mixable). Directories are scanned for
