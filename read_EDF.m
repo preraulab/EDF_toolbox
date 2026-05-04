@@ -257,6 +257,12 @@ addParameter(p, 'RepairHeader', false, @islogical);
 addParameter(p, 'forceMATLAB', false, @islogical);
 addParameter(p, 'debug', false, @islogical);
 addParameter(p, 'deidentify', false, @islogical);
+% TargetFs: resample every raw signal to this rate BEFORE running the
+% derived pipeline. Required when References combine constituents at
+% different native rates -- apply_channel_derivations rejects mixed
+% rates by design, so the caller (typically load_data with resampling
+% enabled) must hand us the target up front. [] = no resample.
+addParameter(p, 'TargetFs', [], @(x) isempty(x) || (isnumeric(x) && isscalar(x) && x>0));
 parse(p, varargin{:});
 
 channels        = p.Results.Channels;
@@ -267,6 +273,7 @@ repair_header   = p.Results.RepairHeader;
 force_matlab    = p.Results.forceMATLAB;
 debug           = p.Results.debug;
 deidentify      = p.Results.deidentify;
+target_fs       = p.Results.TargetFs;
 
 % Decide whether to route through the derived-channels post-processing
 % layer. The legacy backend (MEX in C, or read_EDF_matlab in this file)
@@ -316,7 +323,7 @@ mex_exists = isfile(mex_file);
 % At the very end we trim varargout back down to the caller's nargout
 % so the MATLAB return semantics are unchanged.
 backend_nargout = nargout;
-if use_derived_pipeline
+if use_derived_pipeline || ~isempty(target_fs)
     backend_nargout = max(nargout, 3);
 end
 
@@ -356,6 +363,28 @@ end
 %% ---------------- MATLAB FALLBACK ----------------
 if ~mex_succeeded
     [varargout{1:backend_nargout}] = read_EDF_matlab(edf_fname, backend_channels, epochs, verbose, repair_header, deidentify);
+end
+
+%% ---------------- TARGET-FS RESAMPLE (pre-derive) ----------------
+% Resample every raw signal to a common rate before References /
+% derived-channel math runs. Without this, references that combine
+% constituents at different native rates (e.g. EEG@128 + EOG@32) fail
+% inside apply_channel_derivations. Done here -- on the raw,
+% per-channel signal_cell -- so each row gets resampled with its own
+% native Fs. After this loop every signal_header.sampling_frequency
+% equals target_fs and the derived pipeline sees uniform rates.
+if ~isempty(target_fs) && backend_nargout >= 3
+    sh_raw = varargout{2};
+    sc_raw = varargout{3};
+    for ii = 1:numel(sc_raw)
+        f_native = sh_raw(ii).sampling_frequency;
+        if abs(f_native - target_fs) > 1e-9
+            sc_raw{ii} = smartresample(sc_raw{ii}, f_native, target_fs);
+            sh_raw(ii).sampling_frequency = target_fs;
+        end
+    end
+    varargout{2} = sh_raw;
+    varargout{3} = sc_raw;
 end
 
 %% ---------------- DERIVED PIPELINE (post-load) ----------------
