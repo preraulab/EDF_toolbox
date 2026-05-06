@@ -52,7 +52,7 @@ cd rust && cargo build --release
 | **MEX acceleration** | Compiled C reader; pure MATLAB fallback if MEX isn't available or is disabled |
 | **Compressed input/output** | Reads and writes `.edf.gz` (zlib) and `.edf.zst` (libzstd) directly — no temp file, streaming on the fly. zstd is ~5× faster to compress than gzip-6 with smaller output and is the recommended format. |
 | **Channel subsetting** | Load only specific channels by name |
-| **Re-referencing on load** | `'C3-A2'` (legacy A-B), `'C3 - mean(A1,A2)'` (linked-mastoid style), `'LM = mean(A1,A2)'` named references with `'C3-LM'`, aliased outputs `'OUT = expr'`, `+`/`-` sums, `mean(...)` of N constituents |
+| **Re-referencing on load** | Full linear-combination syntax inside `'Channels'` and `'References'`: `+`, `-`, `*`, `/`, parens, number literals, `mean(...)` of N constituents (args can be expressions), aliased outputs `'OUT = expr'`, named References, `$LABEL$` escapes. Coefficients fold at parse time so the engine evaluates Σⱼ coefⱼ·signalⱼ in one pass. |
 | **Epoch subsetting** | Load only a `[start_epoch end_epoch]` slice |
 | **EDF+ annotations** | Parse TAL (Time-Annotation List) format |
 | **Header repair** | Correct invalid `num_data_records` and save a `_fixed` copy (plain `.edf` only) |
@@ -78,7 +78,7 @@ cd rust && cargo build --release
 
 ### Re-referencing on load
 
-`read_EDF` accepts a small expression syntax inside `'Channels'` so you can derive new signals without round-tripping through MATLAB. Three operators: `+`, `-`, and `mean(...)`. An optional alias prefix `'OUT = expr'` sets the output channel's label.
+`read_EDF` accepts a linear-combination expression syntax inside `'Channels'` (and `'References'`) so you can derive new signals without round-tripping through MATLAB. Operators: `+`, `-`, `*`, `/`, parens, and `mean(...)`. Number literals (integer, decimal, scientific) are allowed. An optional alias prefix `'OUT = expr'` sets the output channel's label. Specs must be **linear** — at most one signal-valued factor per term; pure DC offsets (`signal + scalar`), `signal * signal`, and `scalar / signal` are rejected.
 
 #### Legacy A-B form
 
@@ -124,11 +124,25 @@ Aliased outputs become reusable names for any *later* `'Channels'` entry, so a m
 [~, sh, sc] = read_EDF('psg.edf', 'Channels', { ...
     'LM       = mean(A1, A2)', ...
     'C3_LM    = C3 - LM', ...
-    'NewChan  = C3_LM + 0.5'   % uses both the previous outputs
+    'NewChan  = 0.5*C3_LM + 0.5*LM'   % uses both previous outputs
 });
 ```
 
 The difference vs `'References'`: aliased Channels entries are *returned* as outputs; `'References'` outputs are hidden helpers (drop out of the returned cell unless asked for explicitly). Use `'References'` for intermediates the caller doesn't want to see; use chained `'Channels'` when every step is part of the result. Unaliased entries (`'C3 - A2'` with no `=`) are one-shot — they don't pollute the namespace for later specs.
+
+#### Arbitrary linear combinations
+
+Any expression that's linear in the signals works. Number literals fold into leaf coefficients at parse time, so the engine still evaluates it in one pass:
+
+```matlab
+read_EDF('psg.edf', 'Channels', { ...
+    '0.7*C3 + 0.3*C4', ...                 % weighted average
+    '(1/3)*C1 - 4*(C2 - C3)/7', ...        % arbitrary linear combo
+    'mean(C1, 2*C2 - C3)'                  % expressions inside mean()
+});
+```
+
+`mean(...)` is sugar for `(1/N) * sum(args)`; the args don't have to be bare leaves. Linearity errors (`signal + scalar`, `signal * signal`, etc.) raise `read_EDF:ParseError`.
 
 #### Resolution: how a spec becomes a signal
 

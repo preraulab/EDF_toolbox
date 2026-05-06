@@ -54,34 +54,38 @@ function varargout = read_EDF(edf_fname, varargin)
 %   -------------------------------------------------------------------------
 %   Re-referencing on load
 %
-%   Each 'Channels' entry resolves in this order:
+%   Each 'Channels' entry is preprocessed (greedy longest-match wraps
+%   real labels in '$...$' tokens) and parsed as an expression in this
+%   grammar:
 %
-%     1. Direct-match-wins: the trimmed, case-insensitive entry is
-%        compared against the augmented label set (real EDF labels +
-%        any References defined). On match, that channel is emitted
-%        verbatim. This is what protects EDF labels that themselves
-%        contain operator characters — '[C3-A2 - B]', 'EEG C3-A2',
-%        'C1 - A2', etc. — from being mis-parsed as expressions.
+%       spec   := [name '='] expr
+%       expr   := [sign] term (sign term)*
+%       term   := factor (('*'|'/') factor)*
+%       factor := ['+'|'-'] (number | '$' label '$' | '(' expr ')'
+%                            | mean '(' expr (',' expr)+ ')')
+%       sign   := '+' | '-'
 %
-%     2. Otherwise the entry is parsed as an expression in this small
-%        grammar (whitespace anywhere outside labels is ignored):
+%   The output of parsing is always a flat linear combination
+%   sum_j coef_j * signal[leaf_j] — number literals fold into the
+%   leaf coefficients at parse time, so '(1/3)*C1 - 4*(C2-C3)/7'
+%   becomes leaves={C1,C2,C3}, terms=[1/3, -4/7, 4/7].
 %
-%            spec     := [name '='] expr
-%            expr     := [sign] term (sign term)*
-%            term     := name | mean '(' name (',' name)+ ')'
-%            sign     := '+' | '-'
-%            name     := '$' anything '$'                  | (escape-quoted)
-%                        longest case-insensitive prefix    | (bare)
-%                        match against the augmented label set
+%   Linearity is enforced: a single term may contain at most one
+%   signal-valued factor. The following are rejected with
+%   read_EDF:ParseError:
+%       signal + scalar      (DC offsets not supported)
+%       signal * signal      (not linear)
+%       signal / signal      (not linear)
+%       scalar / signal      (not linear)
 %
-%        The optional 'name =' prefix sets the output channel's label
-%        (alias). Without it the output label is the raw spec string
-%        (matches the behavior of 'C3-A2'). Aliases are mandatory for
-%        References — the whole point is to bind a name.
+%   The optional 'name =' prefix sets the output channel's label
+%   (alias). Without it the output label is the raw spec string.
+%   Aliases are mandatory for References. Aliased Channels entries
+%   are visible by name to subsequent Channels entries (chaining);
+%   unaliased entries are one-shot.
 %
-%     3. mean(c1, ..., cN) requires N >= 2 and produces an inline
-%        equal-weight mean; coefficients (1/N) are flattened into the
-%        final linear combination at parse time.
+%   mean(arg1, ..., argN) requires N >= 2 and produces (1/N) * sum_i argi.
+%   Args may be expressions, not just leaves: mean(C1, C2-C3) works.
 %
 %   Examples (each comment is the equivalent math):
 %
@@ -98,6 +102,11 @@ function varargout = read_EDF(edf_fname, varargin)
 %       % Reference building on a reference
 %       'References', {'M = mean(A1,A2)', 'R = C3 - M'}, ...
 %       'Channels',   {'R'}                            % emits C3 - M
+%
+%       % Arbitrary linear combination
+%       '(1/3)*C1 - 4*(C2 - C3)/7'                     % weighted
+%       '0.7*C3 + 0.3*C4'                              % weighted average
+%       'mean(C1, 2*C2 + C3)'                          % expr inside mean
 %
 %   -------------------------------------------------------------------------
 %   Resolution: how a spec becomes a signal
@@ -784,16 +793,28 @@ end
 function tf = has_derived_syntax(channels)
 %HAS_DERIVED_SYNTAX  Detect whether any 'Channels' entry needs the new pipeline.
 %
-%   Returns true if any string contains 'mean(' (case-insensitive), '='
-%   (alias), '+' (sum operator), or '$' (escape-quoted label). These
-%   markers are absent from plain labels and legacy 'A-B' strings — both
-%   of which the MEX / MATLAB backend handles directly — so this works
-%   as a cheap conservative gate. False positives are harmless (we'd
-%   simply route through the post-processing layer needlessly).
+%   Returns true if any string contains a derived-syntax marker:
+%     mean(  =  +  $  *  /  (
+%
+%   '+' covers sums; '*' and '/' cover scalar-weighted terms; '(' covers
+%   grouping (and 'mean(' as a side effect); '=' covers aliased outputs;
+%   '$' covers escape-quoted labels. Number literals always show up
+%   next to one of these in a real arithmetic spec, so digits alone
+%   don't need to trigger.
+%
+%   We trigger on '(' even though real EDF labels can contain parens —
+%   the false-positive cost is just routing through the derived path,
+%   which is still correct for plain labels.
+%
+%   These markers are absent from plain labels and legacy 'A-B' strings —
+%   both of which the MEX / MATLAB backend handles directly — so this is
+%   a cheap conservative gate. False positives are harmless (we just
+%   route through the post-processing layer needlessly).
 tf = false;
 for k = 1:numel(channels)
     s = lower(channels{k});
-    if contains(s, 'mean(') || contains(s, '=') || contains(s, '+') || contains(s, '$')
+    if contains(s, '=') || contains(s, '+') || contains(s, '$') ...
+            || contains(s, '*') || contains(s, '/') || contains(s, '(')
         tf = true;
         return
     end

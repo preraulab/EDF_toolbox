@@ -314,6 +314,26 @@ end
 
 
 function spec = parse_expr_string(s, all_labels)
+% Parse a spec string into a flat (terms, leaves) linear combination.
+%
+% Grammar:
+%   spec   := [name '='] expr
+%   expr   := [sign] term (sign term)*
+%   term   := factor (('*'|'/') factor)*
+%   factor := ['+'|'-'] (number | '$' label '$' | mean '(' expr (',' expr)+ ')'
+%                        | '(' expr ')')
+%   sign   := '+' | '-'
+%
+% Coefficients fold at parse time: '(1/3)*C1 - 4*(C2-C3)/7' becomes
+%   leaves = {C1, C2, C3}, terms = [1/3, -4/7, 4/7]. The engine then
+% computes  sig = sum_j terms(j) * signal[leaves(j)].
+%
+% The grammar is restricted to LINEAR combinations of signals: a term
+% may contain at most one signal-valued factor. Scalar*scalar and
+% scalar*(signal-expr) and (signal-expr)/scalar fold as expected;
+% scalar/(signal-expr), scalar+(signal-expr), or two signal-valued
+% factors multiplied/divided are rejected as non-linear.
+
 original = s;
 [alias, body] = split_alias(s);
 body = strtrim(body);
@@ -328,31 +348,19 @@ for k = 1:numel(all_labels)
 end
 [~, len_order] = sort(cellfun(@length, labels_lower), 'descend');
 
-terms  = [];
-leaves = {};
-
 cur = 1;
-[cur, sign] = parse_optional_sign(body, cur);
+[result, cur] = parse_expr(body, cur, all_labels, labels_lower, len_order, original);
 
-while true
-    [cur, coefs, lvs] = parse_term(body, cur, all_labels, labels_lower, len_order, original);
-    for j = 1:numel(lvs)
-        terms(end+1)  = sign * coefs(j); %#ok<AGROW>
-        leaves{end+1} = lvs{j};          %#ok<AGROW>
-    end
+cur = skip_ws(body, cur);
+if cur <= length(body)
+    error('read_EDF:ParseError', ...
+        'Unexpected character ''%s'' at position %d in ''%s''.', ...
+        body(cur), cur, original);
+end
 
-    cur = skip_ws(body, cur);
-    if cur > length(body)
-        break
-    end
-    if body(cur) == '+'
-        sign = +1; cur = cur + 1;
-    elseif body(cur) == '-'
-        sign = -1; cur = cur + 1;
-    else
-        error('read_EDF:ParseError', ...
-            'Unexpected character ''%s'' at position %d in ''%s''.', body(cur), cur, original);
-    end
+if result.is_scalar
+    error('read_EDF:ParseError', ...
+        'Expression ''%s'' has no signal — pure scalar.', original);
 end
 
 if isempty(alias)
@@ -361,49 +369,116 @@ else
     out_label = alias;
 end
 
-spec = struct('label', out_label, 'terms', terms, 'leaves', {leaves});
+spec = struct('label', out_label, ...
+    'terms', result.coefs, 'leaves', {result.leaves});
 end
 
 
-function [cur, coefs, leaves] = parse_term(body, cur, all_labels, labels_lower, len_order, original)
+function [r, cur] = parse_expr(body, cur, all_labels, labels_lower, len_order, original)
+[cur, sgn] = parse_optional_sign(body, cur);
+[r, cur]   = parse_term(body, cur, all_labels, labels_lower, len_order, original);
+r = scale_result(r, sgn);
+
+while true
+    cur = skip_ws(body, cur);
+    if cur > length(body) || (body(cur) ~= '+' && body(cur) ~= '-')
+        return
+    end
+    if body(cur) == '+', sgn = 1; else, sgn = -1; end
+    cur = cur + 1;
+    [t, cur] = parse_term(body, cur, all_labels, labels_lower, len_order, original);
+    t = scale_result(t, sgn);
+    r = combine_add(r, t, original);
+end
+end
+
+
+function [r, cur] = parse_term(body, cur, all_labels, labels_lower, len_order, original)
+[r, cur] = parse_factor(body, cur, all_labels, labels_lower, len_order, original);
+while true
+    cur = skip_ws(body, cur);
+    if cur > length(body) || (body(cur) ~= '*' && body(cur) ~= '/')
+        return
+    end
+    op  = body(cur);
+    cur = cur + 1;
+    [f, cur] = parse_factor(body, cur, all_labels, labels_lower, len_order, original);
+    r = combine_muldiv(r, op, f, original);
+end
+end
+
+
+function [r, cur] = parse_factor(body, cur, all_labels, labels_lower, len_order, original)
+cur = skip_ws(body, cur);
+[cur, sgn] = parse_optional_sign(body, cur);
+
 cur = skip_ws(body, cur);
 if cur > length(body)
     error('read_EDF:ParseError', 'Unexpected end of expression in ''%s''.', original);
 end
 
-if cur + 3 <= length(body) && strcmpi(body(cur:cur+3), 'mean')
-    peek = skip_ws(body, cur + 4);
-    if peek <= length(body) && body(peek) == '('
-        [cur, leaves] = parse_mean(body, peek + 1, all_labels, labels_lower, len_order, original);
-        N = numel(leaves);
-        if N < 2
-            error('read_EDF:BadMean', ...
-                'mean(...) needs at least 2 arguments in ''%s''.', original);
-        end
-        coefs = ones(1, N) / N;
-        return
+ch = body(cur);
+
+if ch == '('
+    [inner, cur] = parse_expr(body, cur + 1, all_labels, labels_lower, len_order, original);
+    cur = skip_ws(body, cur);
+    if cur > length(body) || body(cur) ~= ')'
+        error('read_EDF:ParseError', 'Missing '')'' in ''%s''.', original);
     end
-end
+    cur = cur + 1;
+    r = inner;
 
-[cur, label] = match_longest_label(body, cur, all_labels, labels_lower, len_order);
-if isempty(label)
-    error('read_EDF:UnknownChannel', ...
-        'No matching channel at position %d in ''%s''.', cur, original);
-end
-coefs  = 1.0;
-leaves = {label};
-end
-
-
-function [cur, leaves] = parse_mean(body, cur, all_labels, labels_lower, len_order, original)
-leaves = {};
-while true
+elseif ch == '$'
     [cur, label] = match_longest_label(body, cur, all_labels, labels_lower, len_order);
     if isempty(label)
         error('read_EDF:UnknownChannel', ...
-            'No matching channel inside mean() at position %d in ''%s''.', cur, original);
+            'No matching channel at position %d in ''%s''.', cur, original);
     end
-    leaves{end+1} = label; %#ok<AGROW>
+    r = vec_factor(1.0, label);
+
+elseif (ch >= '0' && ch <= '9') || ch == '.'
+    [val, cur] = parse_number(body, cur, original);
+    r = scalar_factor(val);
+
+elseif cur + 3 <= length(body) && strcmpi(body(cur:cur+3), 'mean')
+    peek = skip_ws(body, cur + 4);
+    if peek <= length(body) && body(peek) == '('
+        [r, cur] = parse_mean(body, peek + 1, all_labels, labels_lower, len_order, original);
+    else
+        % 'mean' not followed by '(' — try as a label match (longest-prefix
+        % label that happens to start with 'mean'). The preprocessor
+        % normally wraps real labels in $...$, so this path is unusual.
+        [cur, label] = match_longest_label(body, cur, all_labels, labels_lower, len_order);
+        if isempty(label)
+            error('read_EDF:ParseError', ...
+                'Expected ''('' after ''mean'' at position %d in ''%s''.', cur, original);
+        end
+        r = vec_factor(1.0, label);
+    end
+
+else
+    % Last-ditch: try a bare longest-prefix label match (defensive — the
+    % preprocessor should already have wrapped real labels in $...$).
+    [cur2, label] = match_longest_label(body, cur, all_labels, labels_lower, len_order);
+    if ~isempty(label)
+        cur = cur2;
+        r = vec_factor(1.0, label);
+    else
+        error('read_EDF:ParseError', ...
+            'Unexpected character ''%s'' at position %d in ''%s''.', ch, cur, original);
+    end
+end
+
+r = scale_result(r, sgn);
+end
+
+
+function [r, cur] = parse_mean(body, cur, all_labels, labels_lower, len_order, original)
+% Caller has already consumed 'mean' and '('. Parse (expr (',' expr)+) ')'.
+args = {};
+while true
+    [a, cur] = parse_expr(body, cur, all_labels, labels_lower, len_order, original);
+    args{end+1} = a; %#ok<AGROW>
     cur = skip_ws(body, cur);
     if cur > length(body)
         error('read_EDF:ParseError', 'Unterminated mean(...) in ''%s''.', original);
@@ -412,11 +487,136 @@ while true
         cur = cur + 1;
     elseif body(cur) == ')'
         cur = cur + 1;
-        return
+        break
     else
         error('read_EDF:ParseError', ...
             'Expected '','' or '')'' inside mean() at position %d in ''%s''.', cur, original);
     end
+end
+
+N = numel(args);
+if N < 2
+    error('read_EDF:BadMean', ...
+        'mean(...) needs at least 2 arguments in ''%s''.', original);
+end
+
+% mean = (1/N) * sum_i args_i. Each arg must be a vector (linear comb).
+r = empty_vec();
+for k = 1:N
+    a = args{k};
+    if a.is_scalar
+        error('read_EDF:BadMean', ...
+            'mean() argument %d is a pure scalar in ''%s''.', k, original);
+    end
+    a = scale_result(a, 1/N);
+    r = combine_add(r, a, original);
+end
+end
+
+
+function [val, cur] = parse_number(body, cur, original)
+% Match decimal number with optional fraction and exponent.
+n = length(body);
+start = cur;
+while cur <= n && body(cur) >= '0' && body(cur) <= '9'
+    cur = cur + 1;
+end
+if cur <= n && body(cur) == '.'
+    cur = cur + 1;
+    while cur <= n && body(cur) >= '0' && body(cur) <= '9'
+        cur = cur + 1;
+    end
+end
+if cur <= n && (body(cur) == 'e' || body(cur) == 'E')
+    cur = cur + 1;
+    if cur <= n && (body(cur) == '+' || body(cur) == '-')
+        cur = cur + 1;
+    end
+    while cur <= n && body(cur) >= '0' && body(cur) <= '9'
+        cur = cur + 1;
+    end
+end
+str = body(start:cur-1);
+val = str2double(str);
+if isnan(val)
+    error('read_EDF:ParseError', 'Bad number ''%s'' in ''%s''.', str, original);
+end
+end
+
+
+function r = scalar_factor(v)
+r = struct('is_scalar', true, 'scalar', v, 'coefs', [], 'leaves', {{}});
+end
+
+
+function r = vec_factor(coef, label)
+r = struct('is_scalar', false, 'scalar', 0, 'coefs', coef, 'leaves', {{label}});
+end
+
+
+function r = empty_vec()
+r = struct('is_scalar', false, 'scalar', 0, 'coefs', [], 'leaves', {{}});
+end
+
+
+function r = scale_result(r, s)
+if s == 1, return; end
+if r.is_scalar
+    r.scalar = r.scalar * s;
+else
+    r.coefs = r.coefs * s;
+end
+end
+
+
+function r = combine_add(a, b, original)
+if a.is_scalar && b.is_scalar
+    r = scalar_factor(a.scalar + b.scalar);
+elseif a.is_scalar || b.is_scalar
+    error('read_EDF:ParseError', ...
+        'Cannot add a scalar to a signal expression in ''%s'' (DC offsets not supported).', original);
+else
+    r = struct('is_scalar', false, 'scalar', 0, ...
+        'coefs', [a.coefs, b.coefs], ...
+        'leaves', {[a.leaves, b.leaves]});
+end
+end
+
+
+function r = combine_muldiv(a, op, b, original)
+if a.is_scalar && b.is_scalar
+    if op == '*'
+        r = scalar_factor(a.scalar * b.scalar);
+    else
+        if b.scalar == 0
+            error('read_EDF:ParseError', 'Division by zero in ''%s''.', original);
+        end
+        r = scalar_factor(a.scalar / b.scalar);
+    end
+elseif a.is_scalar && ~b.is_scalar
+    if op == '*'
+        r = scale_result(b, a.scalar);
+    else
+        error('read_EDF:ParseError', ...
+            'Cannot divide a scalar by a signal expression in ''%s'' (not linear).', original);
+    end
+elseif ~a.is_scalar && b.is_scalar
+    if op == '*'
+        r = scale_result(a, b.scalar);
+    else
+        if b.scalar == 0
+            error('read_EDF:ParseError', 'Division by zero in ''%s''.', original);
+        end
+        r = scale_result(a, 1.0 / b.scalar);
+    end
+else
+    if op == '*'
+        verb = 'multiply';
+    else
+        verb = 'divide';
+    end
+    error('read_EDF:ParseError', ...
+        'Cannot %s two signal expressions in ''%s'' (not linear).', verb, original);
 end
 end
 
