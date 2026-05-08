@@ -1,8 +1,19 @@
-function [sh_out, sc_out] = apply_channel_derivations(sh_in, sc_in, channels, references, verbose)
+function [sh_out, sc_out] = apply_channel_derivations(sh_in, sc_in, channels, references, verbose, dry_run)
 %APPLY_CHANNEL_DERIVATIONS  Build references and emit derived channels.
 %
 %   [SH_OUT, SC_OUT] = APPLY_CHANNEL_DERIVATIONS(SH_IN, SC_IN, CHANNELS,
-%                                                REFERENCES, VERBOSE)
+%                                                REFERENCES, VERBOSE, DRY_RUN)
+%
+%   DRY_RUN (logical, default false). When true, the function returns the
+%   list of channel specs that WOULD have resolved (sh_out's labels) without
+%   touching any signal data — only labels and sampling rates are needed.
+%   sc_in may be an empty cell array (or a cellstr of {}/[] placeholders
+%   length-aligned with sh_in); sc_out is returned as a cell of empties.
+%   This is the resolution-only path used by the GUI's pre-flight scan to
+%   answer "for this file's label set, which output names will I produce?"
+%   without paying the cost of an EDF read. The same parser/RefCollision
+%   semantics as the live path apply, so dry-run results match exactly what
+%   a real run would emit.
 %
 %   Shared derivation pipeline used by both READ_EDF and WRITE_EDF so the
 %   same expression syntax means the same thing on the read and write
@@ -45,11 +56,12 @@ function [sh_out, sc_out] = apply_channel_derivations(sh_in, sc_in, channels, re
 %   are foundation pieces. The 'read_EDF:' prefix is preserved
 %   regardless of caller so existing handlers keep working.
 
+if nargin < 6, dry_run = false; end
 if nargin < 5, verbose = false; end
 if nargin < 4, references = {}; end
 
 % Step 1: pre-bake every reference into the loaded signal set.
-[sh_aug, sc_aug] = compute_references(references, sh_in, sc_in, verbose);
+[sh_aug, sc_aug] = compute_references(references, sh_in, sc_in, verbose, dry_run);
 
 n_real = numel(sh_in);
 
@@ -118,23 +130,43 @@ for k = 1:numel(channels)
                  'or earlier output / reference.'], user_alias);
         end
 
-        sig = zeros(size(sc_aug{leaf_idx(1)}));
-        for j = 1:numel(spec.terms)
-            sig = sig + spec.terms(j) * sc_aug{leaf_idx(j)};
+        if dry_run
+            % Resolution-only path: no signal arithmetic. Clone the
+            % header, set the output label, and emit. Skip
+            % physical_min/max (no signal to derive them from).
+            new_sh = sh_aug(leaf_idx(1));
+            new_sh.signal_labels = spec.label;
+            sig = [];   %#ok<NASGU>  placeholder, not used
+        else
+            sig = zeros(size(sc_aug{leaf_idx(1)}));
+            for j = 1:numel(spec.terms)
+                sig = sig + spec.terms(j) * sc_aug{leaf_idx(j)};
+            end
+
+            new_sh = sh_aug(leaf_idx(1));
+            new_sh.signal_labels = spec.label;
+            new_sh.physical_min  = min(sig);
+            new_sh.physical_max  = max(sig);
         end
 
-        new_sh = sh_aug(leaf_idx(1));
-        new_sh.signal_labels = spec.label;
-        new_sh.physical_min  = min(sig);
-        new_sh.physical_max  = max(sig);
-
         sh_out(end+1) = new_sh; %#ok<AGROW>
-        sc_out{end+1}  = sig;     %#ok<AGROW>
+        if dry_run
+            sc_out{end+1} = []; %#ok<AGROW>
+        else
+            sc_out{end+1}  = sig; %#ok<AGROW>
+        end
 
         % Chaining: aliased outputs become reusable names downstream.
+        % In dry_run mode we still need to extend aug_labels so later
+        % specs that reference this alias resolve, but sc_aug just gets
+        % a placeholder.
         if ~isempty(user_alias)
             sh_aug(end+1)  = new_sh; %#ok<AGROW>
-            sc_aug{end+1}  = sig;     %#ok<AGROW>
+            if dry_run
+                sc_aug{end+1} = []; %#ok<AGROW>
+            else
+                sc_aug{end+1} = sig; %#ok<AGROW>
+            end
             aug_labels{end+1} = user_alias; %#ok<AGROW>
         end
     catch ME
@@ -155,8 +187,15 @@ for k = 1:numel(channels)
         if strcmp(ME.identifier, 'read_EDF:UnknownChannel') || ...
                 strcmp(ME.identifier, 'read_EDF:ParseError') || ...
                 strcmp(ME.identifier, 'read_EDF:RefCollision')
-            warning(ME.identifier, ...
-                'Skipping channel ''%s'': %s', spec_str, ME.message);
+            % In dry_run mode the caller is asking "what would resolve?"
+            % across many files — emitting a warning per dropped spec
+            % per file would flood the command window. The drop itself
+            % is reflected in sh_out (the spec doesn't appear there),
+            % which is all the caller needs.
+            if ~dry_run
+                warning(ME.identifier, ...
+                    'Skipping channel ''%s'': %s', spec_str, ME.message);
+            end
             continue
         end
         rethrow(ME);
@@ -165,8 +204,9 @@ end
 end
 
 
-function [sh_aug, sc_aug] = compute_references(refs, sh, sc, verbose)
+function [sh_aug, sc_aug] = compute_references(refs, sh, sc, verbose, dry_run)
 %COMPUTE_REFERENCES  Pre-bake named References into the loaded signal set.
+if nargin < 5, dry_run = false; end
 if nargin < 4, verbose = false; end
 
 sh_aug = sh;
@@ -229,18 +269,25 @@ for k = 1:numel(refs)
             'Reference ''%s'' has constituents at different sampling rates: %s', name, strjoin(parts, ', '));
     end
 
-    sig = zeros(size(sc_aug{leaf_idx(1)}));
-    for j = 1:numel(spec.terms)
-        sig = sig + spec.terms(j) * sc_aug{leaf_idx(j)};
+    if dry_run
+        new_sh = sh_aug(leaf_idx(1));
+        new_sh.signal_labels = name;
+        sh_aug(end+1) = new_sh; %#ok<AGROW>
+        sc_aug{end+1} = []; %#ok<AGROW>
+    else
+        sig = zeros(size(sc_aug{leaf_idx(1)}));
+        for j = 1:numel(spec.terms)
+            sig = sig + spec.terms(j) * sc_aug{leaf_idx(j)};
+        end
+
+        new_sh = sh_aug(leaf_idx(1));
+        new_sh.signal_labels = name;
+        new_sh.physical_min  = min(sig);
+        new_sh.physical_max  = max(sig);
+
+        sh_aug(end+1) = new_sh; %#ok<AGROW>
+        sc_aug{end+1}  = sig;     %#ok<AGROW>
     end
-
-    new_sh = sh_aug(leaf_idx(1));
-    new_sh.signal_labels = name;
-    new_sh.physical_min  = min(sig);
-    new_sh.physical_max  = max(sig);
-
-    sh_aug(end+1) = new_sh; %#ok<AGROW>
-    sc_aug{end+1}  = sig;     %#ok<AGROW>
     ref_names_lower{end+1} = name_lower; %#ok<AGROW>
 end
 end
