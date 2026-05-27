@@ -1,1 +1,4 @@
 *.asv
+
+# MEX build artifacts — recompiled on first use via compile_edf_mex.m
+*.mex*

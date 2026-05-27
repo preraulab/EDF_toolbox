@@ -9,7 +9,14 @@
  *
  * MATLAB usage:
  *   [header, sigheader, data, annotations] =
- *       read_EDF_mex(filename, channels, epochs, verbose, repair, debug)
+ *       read_EDF_mex(filename, channels, epochs, verbose, repair, debug,
+ *                    assumed_record_duration)
+ *
+ *   assumed_record_duration (optional, default 1.0) is used when
+ *   `repair` is true AND the on-disk data_record_duration is zero —
+ *   that field is user-supplied scientific metadata that can't be
+ *   derived from file structure. Pass the lab's epoch length
+ *   (typically 1, 10, or 30 seconds) to make the repair correct.
  *
  * Compilation:
  *   mex -O -largeArrayDims read_EDF_mex.c -lz -lzstd
@@ -599,6 +606,65 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     DBG("Num signals: %d\n",            hdr.num_signals);
     DBG("===========================\n\n");
 
+    /* ============================================================
+     *      REPAIR MAIN HEADER (pre-signal-headers, plain only)
+     * ============================================================
+     *
+     * num_header_bytes is deterministic from num_signals
+     * (256 main header + 256 per signal). data_record_duration is
+     * scientific metadata that can't be derived from file structure —
+     * fall back to `assumed_rec_dur` (default 1.0) and warn so the
+     * caller can verify against the recording. Both repairs need their
+     * dependency field non-zero; if those are also corrupt the ASSERTs
+     * below surface the error. Compressed inputs skip the on-disk
+     * write (can't rewrite a byte of a .gz/.zst in place) but the
+     * in-memory header is still patched.
+     */
+    int repair = (nrhs > 4 && mxGetScalar(prhs[4]) != 0);
+    double assumed_rec_dur = (nrhs > 6) ? mxGetScalar(prhs[6]) : 1.0;
+
+    if (repair) {
+        if (hdr.num_header_bytes == 0 && hdr.num_signals > 0) {
+            int expected_hb = 256 + 256 * hdr.num_signals;
+            if (rd.comp == COMP_NONE) {
+                FILE *fw = fopen(fname, "r+b");
+                if (fw) {
+                    char hb_str[9];
+                    snprintf(hb_str, 9, "%-8d", expected_hb);
+                    fseek(fw, 184, SEEK_SET);
+                    fwrite(hb_str, 1, 8, fw);
+                    fclose(fw);
+                    if (verbose)
+                        mexPrintf("Header repaired: num_header_bytes set to %d (= 256 + 256*%d signals).\n",
+                                  expected_hb, hdr.num_signals);
+                }
+            } else if (verbose) {
+                mexPrintf("RepairHeader requested for compressed input — patching in-memory only.\n");
+            }
+            hdr.num_header_bytes = expected_hb;
+        }
+
+        if (hdr.data_record_duration == 0.0 && hdr.num_data_records > 0) {
+            if (rd.comp == COMP_NONE) {
+                FILE *fw = fopen(fname, "r+b");
+                if (fw) {
+                    char dur_str[9];
+                    snprintf(dur_str, 9, "%-8g", assumed_rec_dur);
+                    fseek(fw, 244, SEEK_SET);
+                    fwrite(dur_str, 1, 8, fw);
+                    fclose(fw);
+                    if (verbose)
+                        mexPrintf("Header repaired: data_record_duration set to %g (ASSUMED — pass AssumedRecordDuration to override).\n",
+                                  assumed_rec_dur);
+                }
+            }
+            hdr.data_record_duration = assumed_rec_dur;
+            mexWarnMsgIdAndTxt("read_EDF_mex:AssumedRecordDuration",
+                "data_record_duration was 0; assumed %g seconds/record. Verify against the recording metadata (typical lab values: 1, 10, 30).",
+                assumed_rec_dur);
+        }
+    }
+
     ASSERT(hdr.num_signals > 0);
     ASSERT(hdr.num_header_bytes >= 256);
     ASSERT(hdr.data_record_duration > 0);
@@ -634,8 +700,6 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     /* ============================================================
      *           FIX EDF+ num_data_records (plain files only)
      * ============================================================ */
-
-    int repair = (nrhs > 4 && mxGetScalar(prhs[4]) != 0);
 
     if (rd.comp != COMP_NONE) {
         if (repair && verbose)

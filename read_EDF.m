@@ -31,10 +31,33 @@ function varargout = read_EDF(edf_fname, varargin)
 %       'Epochs'       : 1x2 vector [start_epoch end_epoch] (0-indexed,
 %                        default: all)
 %       'Verbose'      : logical - print progress / status (default false)
-%       'RepairHeader' : logical - correct an invalid num_data_records
-%                        in the file header and save a '_fixed' copy
-%                        (default false; ignored with a warning for
-%                        compressed inputs).
+%       'RepairHeader' : logical - correct corrupted-but-recoverable
+%                        fields in the main header (default false;
+%                        ignored with a warning for compressed inputs).
+%                        Repairs, in order:
+%                          (1) num_header_bytes — set to
+%                              256 + 256*num_signals when the field is
+%                              zero (deterministic from num_signals).
+%                          (2) data_record_duration — set to
+%                              'AssumedRecordDuration' (default 1.0)
+%                              when the field is zero. The value is
+%                              user-supplied scientific metadata that
+%                              cannot be derived from file structure;
+%                              an explicit warning is emitted so the
+%                              caller knows to verify against the
+%                              recording's metadata.
+%                          (3) num_data_records — recompute from the
+%                              actual file size when the header value
+%                              disagrees (the original repair scope).
+%                        Repairs (1) and (2) require their dependency
+%                        fields (num_signals, num_data_records) to be
+%                        non-zero; if those are also corrupt the file
+%                        is rejected with an error.
+%       'AssumedRecordDuration' : numeric - seconds per data record to
+%                        write into the header when RepairHeader sees
+%                        data_record_duration=0. Default 1.0 (the
+%                        EDF-spec canonical value). Override if your
+%                        lab convention is e.g. 10 or 30.
 %       'forceMATLAB'  : logical - disable the MEX backend and use the
 %                        pure-MATLAB reader (default false). Compressed
 %                        inputs are decompressed to a temp file in this
@@ -288,11 +311,26 @@ if ~isfile(edf_fname)
 end
 
 p = inputParser;
+% Strict settings — defaults bite. Without these, a typo like
+% 'Chan' silently matches 'Channels' (PartialMatching), and any genuine
+% parse error blames `inputParser:...` instead of `read_EDF:...`.
+% KeepUnmatched=false (default) makes an unknown name/value pair a hard
+% error rather than a silent ignore — explicit so future edits don't
+% accidentally flip it.
+p.FunctionName    = 'read_EDF';
+p.KeepUnmatched   = false;
+p.PartialMatching = false;
+p.CaseSensitive   = false;
 addParameter(p, 'Channels', {}, @iscell);
 addParameter(p, 'References', {}, @iscell);
 addParameter(p, 'Epochs', [], @isnumeric);
 addParameter(p, 'Verbose', false, @islogical);
 addParameter(p, 'RepairHeader', false, @islogical);
+% Used by RepairHeader when data_record_duration is zero. Cannot be
+% derived from file structure (it's scientific metadata the writer
+% chose), so we let the caller pick. 1.0 is the EDF-spec canonical
+% default; many labs use 10 or 30 instead.
+addParameter(p, 'AssumedRecordDuration', 1.0, @(x) isnumeric(x) && isscalar(x) && x > 0);
 addParameter(p, 'forceMATLAB', false, @islogical);
 addParameter(p, 'debug', false, @islogical);
 addParameter(p, 'deidentify', false, @islogical);
@@ -309,6 +347,7 @@ references      = p.Results.References;
 epochs          = p.Results.Epochs;
 verbose         = p.Results.Verbose;
 repair_header   = p.Results.RepairHeader;
+assumed_rec_dur = p.Results.AssumedRecordDuration;
 force_matlab    = p.Results.forceMATLAB;
 debug           = p.Results.debug;
 deidentify      = p.Results.deidentify;
@@ -372,7 +411,7 @@ if ~force_matlab
         compile_edf_mex(script_dir, 'read_EDF_mex.c');
     end
     try
-        [varargout{1:backend_nargout}] = read_EDF_mex(edf_fname, backend_channels, epochs, verbose, repair_header, debug);
+        [varargout{1:backend_nargout}] = read_EDF_mex(edf_fname, backend_channels, epochs, verbose, repair_header, debug, assumed_rec_dur);
 
         if backend_nargout>0
             %Add the total data in seconds
@@ -515,6 +554,57 @@ for k = 1:numel(fields)
         header.(fields{k}) = str2double(str);
     else
         header.(fields{k}) = str;
+    end
+end
+
+%% ---------------- REPAIR MAIN HEADER (pre-signal-headers) ----------------
+% num_header_bytes is deterministic from num_signals
+% (256 main + 256 per signal). data_record_duration is scientific
+% metadata that the writer chose — fall back to 'AssumedRecordDuration'
+% (default 1.0) and emit a warning so the caller knows to verify
+% against the recording's epoch length. Both repairs require their
+% dependency field (num_signals / num_data_records) to be non-zero; if
+% those are also corrupt the downstream signal-header read or duration
+% math surfaces the error.
+if repair_header
+    if header.num_header_bytes == 0 && header.num_signals > 0
+        expected_hb = 256 + 256 * header.num_signals;
+        fw = fopen(edf_fname, 'r+', 'ieee-le');
+        if fw < 0
+            warning('read_EDF:RepairFailed', ...
+                'Could not open file to repair num_header_bytes: %s', edf_fname);
+        else
+            hb_str = sprintf('%-8d', expected_hb);   % left-justified, space-padded
+            fseek(fw, 184, 'bof');                   % EDF spec: bytes 184..191
+            fwrite(fw, uint8(hb_str), 'uint8');
+            fclose(fw);
+            if verbose
+                fprintf('Header repaired: num_header_bytes set to %d (= 256 + 256*%d signals).\n', ...
+                    expected_hb, header.num_signals);
+            end
+        end
+        header.num_header_bytes = expected_hb;
+    end
+
+    if header.data_record_duration == 0 && header.num_data_records > 0
+        fw = fopen(edf_fname, 'r+', 'ieee-le');
+        if fw < 0
+            warning('read_EDF:RepairFailed', ...
+                'Could not open file to repair data_record_duration: %s', edf_fname);
+        else
+            dur_str = sprintf('%-8g', assumed_rec_dur);   % left-justified, space-padded
+            fseek(fw, 244, 'bof');                        % EDF spec: bytes 244..251
+            fwrite(fw, uint8(dur_str), 'uint8');
+            fclose(fw);
+            if verbose
+                fprintf('Header repaired: data_record_duration set to %g (ASSUMED — pass AssumedRecordDuration to override).\n', ...
+                    assumed_rec_dur);
+            end
+        end
+        warning('read_EDF:AssumedRecordDuration', ...
+            'data_record_duration was 0; assumed %g seconds/record. Verify against the recording metadata (typical lab values: 1, 10, 30).', ...
+            assumed_rec_dur);
+        header.data_record_duration = assumed_rec_dur;
     end
 end
 
