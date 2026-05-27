@@ -364,6 +364,13 @@ static double infer_record_duration(const int *samples_in_record, int n_signals,
     static const int candidates[]   = {1, 2, 4, 5, 10, 15, 20, 30, 60};
     static const int common_rates[] = {1, 5, 10, 16, 25, 32, 50, 64, 100, 125, 128,
                                        200, 250, 256, 400, 500, 512, 1000, 1024, 2000, 2048};
+    /* EEG-rate floor — sleep cohorts always have an EEG channel and EEG
+     * is never sampled below 100 Hz in practice. Candidates where the
+     * highest implied rate is below this aren't real options (would
+     * imply sub-EEG-rate EEG). Without the floor, low rates like
+     * r=20s falsely tie with the real answer when low common rates
+     * (16, 64) are legitimately used for respiration / SpO2 channels. */
+    const double min_eeg_rate = 100.0;
     const int n_cand  = sizeof(candidates)   / sizeof(candidates[0]);
     const int n_rates = sizeof(common_rates) / sizeof(common_rates[0]);
 
@@ -372,6 +379,7 @@ static double infer_record_duration(const int *samples_in_record, int n_signals,
     for (int i = 0; i < n_cand; i++) {
         int r = candidates[i];
         int all_ok = 1;
+        double max_rate = 0.0;
         for (int s = 0; s < n_signals; s++) {
             double v = (double)samples_in_record[s] / (double)r;
             if (fabs(v - round(v)) > 1e-6) { all_ok = 0; break; }
@@ -380,8 +388,10 @@ static double infer_record_duration(const int *samples_in_record, int n_signals,
                 if (fabs((double)common_rates[k] - v) < 0.5) { matched = 1; break; }
             }
             if (!matched) { all_ok = 0; break; }
+            if (v > max_rate) max_rate = v;
         }
-        if (all_ok && n_fits < (int)(sizeof(fits)/sizeof(fits[0]))) {
+        if (all_ok && max_rate >= min_eeg_rate
+            && n_fits < (int)(sizeof(fits)/sizeof(fits[0]))) {
             fits[n_fits++] = r;
         }
     }

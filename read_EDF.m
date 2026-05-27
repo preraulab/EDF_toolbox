@@ -1133,13 +1133,21 @@ function [dur, info] = infer_record_duration_from_signals(samples_in_record)
 candidates   = [1, 2, 4, 5, 10, 15, 20, 30, 60];
 common_rates = [1, 5, 10, 16, 25, 32, 50, 64, 100, 125, 128, ...
                 200, 250, 256, 400, 500, 512, 1000, 1024, 2000, 2048];
+% EEG-rate floor: a sleep cohort has at least one EEG channel, and EEG
+% is never sampled below 100 Hz in practice (the lowest historical EEG
+% rate that landed in production sleep gear is 100 Hz). Candidates
+% where the highest-rate signal is below 100 Hz can't be real — they'd
+% imply EEG at sub-EEG rate. Without this filter, low candidates like
+% r=20s falsely tie with the real answer when low common rates (16, 64)
+% are legitimately used for respiration / SpO2 channels.
+min_eeg_rate = 100;
 
 fits = [];
 for r = candidates
     rates = samples_in_record / r;
     is_int    = abs(rates - round(rates)) < 1e-6;
     is_common = arrayfun(@(c) any(abs(common_rates - c) < 0.5), rates);
-    if all(is_int) && all(is_common)
+    if all(is_int) && all(is_common) && max(rates) >= min_eeg_rate
         fits(end+1) = r;   %#ok<AGROW>
     end
 end
