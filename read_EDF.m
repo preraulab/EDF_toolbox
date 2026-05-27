@@ -33,31 +33,32 @@ function varargout = read_EDF(edf_fname, varargin)
 %       'Verbose'      : logical - print progress / status (default false)
 %       'RepairHeader' : logical - correct corrupted-but-recoverable
 %                        fields in the main header (default false;
-%                        ignored with a warning for compressed inputs).
+%                        on-disk write skipped for compressed inputs).
 %                        Repairs, in order:
 %                          (1) num_header_bytes — set to
-%                              256 + 256*num_signals when the field is
-%                              zero (deterministic from num_signals).
-%                          (2) data_record_duration — set to
-%                              'AssumedRecordDuration' (default 1.0)
-%                              when the field is zero. The value is
-%                              user-supplied scientific metadata that
-%                              cannot be derived from file structure;
-%                              an explicit warning is emitted so the
-%                              caller knows to verify against the
-%                              recording's metadata.
+%                              256 + 256*num_signals when zero
+%                              (deterministic from num_signals).
+%                          (2) data_record_duration — when zero,
+%                              inferred from per-signal samples_in_record:
+%                              the writer's intended duration is the
+%                              value where samples / duration lands on a
+%                              common PSG sampling rate for every
+%                              signal. Falls back to AssumedRecordDuration
+%                              (default 1.0) when inference can't pick
+%                              uniquely; a warning fires on that path.
 %                          (3) num_data_records — recompute from the
 %                              actual file size when the header value
 %                              disagrees (the original repair scope).
 %                        Repairs (1) and (2) require their dependency
-%                        fields (num_signals, num_data_records) to be
-%                        non-zero; if those are also corrupt the file
-%                        is rejected with an error.
-%       'AssumedRecordDuration' : numeric - seconds per data record to
-%                        write into the header when RepairHeader sees
-%                        data_record_duration=0. Default 1.0 (the
-%                        EDF-spec canonical value). Override if your
-%                        lab convention is e.g. 10 or 30.
+%                        fields (num_signals / num_data_records) to be
+%                        non-zero; otherwise downstream code surfaces
+%                        the error.
+%       'AssumedRecordDuration' : numeric - fallback record duration
+%                        used by RepairHeader only when
+%                        data_record_duration is zero AND inference
+%                        from signal-header samples_in_record can't
+%                        pick uniquely. Default 1.0. Override to force
+%                        a specific value over whatever inference picks.
 %       'forceMATLAB'  : logical - disable the MEX backend and use the
 %                        pure-MATLAB reader (default false). Compressed
 %                        inputs are decompressed to a temp file in this
@@ -557,55 +558,28 @@ for k = 1:numel(fields)
     end
 end
 
-%% ---------------- REPAIR MAIN HEADER (pre-signal-headers) ----------------
-% num_header_bytes is deterministic from num_signals
-% (256 main + 256 per signal). data_record_duration is scientific
-% metadata that the writer chose — fall back to 'AssumedRecordDuration'
-% (default 1.0) and emit a warning so the caller knows to verify
-% against the recording's epoch length. Both repairs require their
-% dependency field (num_signals / num_data_records) to be non-zero; if
-% those are also corrupt the downstream signal-header read or duration
-% math surfaces the error.
-if repair_header
-    if header.num_header_bytes == 0 && header.num_signals > 0
-        expected_hb = 256 + 256 * header.num_signals;
-        fw = fopen(edf_fname, 'r+', 'ieee-le');
-        if fw < 0
-            warning('read_EDF:RepairFailed', ...
-                'Could not open file to repair num_header_bytes: %s', edf_fname);
-        else
-            hb_str = sprintf('%-8d', expected_hb);   % left-justified, space-padded
-            fseek(fw, 184, 'bof');                   % EDF spec: bytes 184..191
-            fwrite(fw, uint8(hb_str), 'uint8');
-            fclose(fw);
-            if verbose
-                fprintf('Header repaired: num_header_bytes set to %d (= 256 + 256*%d signals).\n', ...
-                    expected_hb, header.num_signals);
-            end
+%% ---------------- REPAIR num_header_bytes (pre-signal-headers) ----------------
+% Deterministic from num_signals (256 main + 256 per signal). Has to
+% run before signal headers are parsed below — that read consumes
+% (num_header_bytes - 256) bytes and silently does nothing when this
+% field is zero. Requires num_signals to be non-zero.
+if repair_header && header.num_header_bytes == 0 && header.num_signals > 0
+    expected_hb = 256 + 256 * header.num_signals;
+    fw = fopen(edf_fname, 'r+', 'ieee-le');
+    if fw < 0
+        warning('read_EDF:RepairFailed', ...
+            'Could not open file to repair num_header_bytes: %s', edf_fname);
+    else
+        hb_str = sprintf('%-8d', expected_hb);
+        fseek(fw, 184, 'bof');
+        fwrite(fw, uint8(hb_str), 'uint8');
+        fclose(fw);
+        if verbose
+            fprintf('Header repaired: num_header_bytes set to %d (= 256 + 256*%d signals).\n', ...
+                expected_hb, header.num_signals);
         end
-        header.num_header_bytes = expected_hb;
     end
-
-    if header.data_record_duration == 0 && header.num_data_records > 0
-        fw = fopen(edf_fname, 'r+', 'ieee-le');
-        if fw < 0
-            warning('read_EDF:RepairFailed', ...
-                'Could not open file to repair data_record_duration: %s', edf_fname);
-        else
-            dur_str = sprintf('%-8g', assumed_rec_dur);   % left-justified, space-padded
-            fseek(fw, 244, 'bof');                        % EDF spec: bytes 244..251
-            fwrite(fw, uint8(dur_str), 'uint8');
-            fclose(fw);
-            if verbose
-                fprintf('Header repaired: data_record_duration set to %g (ASSUMED — pass AssumedRecordDuration to override).\n', ...
-                    assumed_rec_dur);
-            end
-        end
-        warning('read_EDF:AssumedRecordDuration', ...
-            'data_record_duration was 0; assumed %g seconds/record. Verify against the recording metadata (typical lab values: 1, 10, 30).', ...
-            assumed_rec_dur);
-        header.data_record_duration = assumed_rec_dur;
-    end
+    header.num_header_bytes = expected_hb;
 end
 
 %% ---------------- READ SIGNAL HEADERS ----------------
@@ -636,6 +610,52 @@ end
 
 new_signal_labels = cellfun(@strip,{signal_header.signal_labels},'UniformOutput', false);
 [signal_header.signal_labels] = deal(new_signal_labels{:});
+
+%% ---------------- REPAIR data_record_duration (post-signal-headers) ----------------
+% Infer from per-signal samples_in_record: the writer chose
+% data_record_duration such that samples_in_record / data_record_duration
+% lands on a common PSG sampling rate for every signal. Try a small set
+% of candidate durations, keep the ones where ALL signals' rates match
+% the common-rate table; tie-break on longest record (the older-PSG
+% convention where this field is most often zeroed by a non-compliant
+% writer). Falls back to 'AssumedRecordDuration' only when inference
+% can't pick a value — emits a single hard warning so the caller knows
+% to verify before trusting downstream sampling-rate math.
+if repair_header && header.data_record_duration == 0 && header.num_data_records > 0
+    [derived, derive_info] = infer_record_duration_from_signals( ...
+        [signal_header.samples_in_record]);
+    if ~isnan(derived)
+        new_dur = derived;
+        repair_source = sprintf('derived from signal headers: %s', derive_info);
+        warn_caller = false;
+    else
+        new_dur = assumed_rec_dur;
+        repair_source = sprintf('using AssumedRecordDuration=%g (%s)', ...
+            assumed_rec_dur, derive_info);
+        warn_caller = true;
+    end
+
+    fw = fopen(edf_fname, 'r+', 'ieee-le');
+    if fw < 0
+        warning('read_EDF:RepairFailed', ...
+            'Could not open file to repair data_record_duration: %s', edf_fname);
+    else
+        dur_str = sprintf('%-8g', new_dur);
+        fseek(fw, 244, 'bof');
+        fwrite(fw, uint8(dur_str), 'uint8');
+        fclose(fw);
+        if verbose
+            fprintf('Header repaired: data_record_duration set to %g (%s).\n', ...
+                new_dur, repair_source);
+        end
+    end
+    if warn_caller
+        warning('read_EDF:AssumedRecordDuration', ...
+            'data_record_duration could not be inferred from signal headers; assumed %g s/record. Verify against the recording metadata.', ...
+            new_dur);
+    end
+    header.data_record_duration = new_dur;
+end
 
 %% ---------------- CHANNEL PLAN ----------------
 % Inspect all requested channels. Identify plain channel requests and A-B
@@ -1093,4 +1113,48 @@ end
 % =========================================================================
 function s = shell_quote(s)
 s = ['''' strrep(s, '''', '''\''''') ''''];
+end
+
+
+%% =========================================================================
+%  RECORD-DURATION INFERENCE FROM SIGNAL HEADERS
+%  ------------------------------------------------------------------------
+%  Used by RepairHeader when data_record_duration is zero in the file.
+%  EDF stores per-signal samples_in_record in the signal-header block
+%  (intact even when the main-header numeric fields are wiped). For every
+%  candidate record duration r, the implied sampling rate of each signal
+%  is samples_in_record / r — and that must land on a common PSG rate
+%  (EEG, EOG, EMG, EKG, respiration, SpO2). The candidate where ALL
+%  signals' rates match is the writer's intended record duration.
+%  Tie-break on longest, since the field is most often zeroed by older
+%  PSG writers that used 10 s / 30 s records.
+% =========================================================================
+function [dur, info] = infer_record_duration_from_signals(samples_in_record)
+candidates   = [1, 2, 4, 5, 10, 15, 20, 30, 60];
+common_rates = [1, 5, 10, 16, 25, 32, 50, 64, 100, 125, 128, ...
+                200, 250, 256, 400, 500, 512, 1000, 1024, 2000, 2048];
+
+fits = [];
+for r = candidates
+    rates = samples_in_record / r;
+    is_int    = abs(rates - round(rates)) < 1e-6;
+    is_common = arrayfun(@(c) any(abs(common_rates - c) < 0.5), rates);
+    if all(is_int) && all(is_common)
+        fits(end+1) = r;   %#ok<AGROW>
+    end
+end
+
+if isempty(fits)
+    dur  = NaN;
+    info = 'no candidate record duration mapped samples_in_record to common PSG rates';
+    return
+end
+
+dur = max(fits);   % tie-break: prefer longer record
+if numel(fits) > 1
+    info = sprintf('%g s (candidates fit: %s; picked longest)', ...
+        dur, strjoin(arrayfun(@(x) num2str(x), fits, 'UniformOutput', false), ', '));
+else
+    info = sprintf('%g s (unique fit)', dur);
+end
 end

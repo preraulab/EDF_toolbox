@@ -12,11 +12,12 @@
  *       read_EDF_mex(filename, channels, epochs, verbose, repair, debug,
  *                    assumed_record_duration)
  *
- *   assumed_record_duration (optional, default 1.0) is used when
- *   `repair` is true AND the on-disk data_record_duration is zero —
- *   that field is user-supplied scientific metadata that can't be
- *   derived from file structure. Pass the lab's epoch length
- *   (typically 1, 10, or 30 seconds) to make the repair correct.
+ *   assumed_record_duration (optional, default 1.0) is the fallback
+ *   used when `repair` is true AND data_record_duration is zero AND
+ *   inference from per-signal samples_in_record can't pick a unique
+ *   common-PSG-rate fit. Most cohorts repair without needing it; pass
+ *   the lab's epoch length explicitly if you want to force a specific
+ *   value over whatever inference produces.
  *
  * Compilation:
  *   mex -O -largeArrayDims read_EDF_mex.c -lz -lzstd
@@ -42,6 +43,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <math.h>
 #include <zlib.h>
 #include <zstd.h>
 
@@ -344,6 +346,71 @@ static int read_signal_headers(EDFReader *rd, Signal_Header *sh, int nsig)
 }
 
 /* ============================================================
+ *      RECORD-DURATION INFERENCE FROM SIGNAL HEADERS
+ * ============================================================
+ *
+ * Used by RepairHeader when data_record_duration is zero in the file.
+ * For every candidate record duration r, the implied sampling rate of
+ * each signal is samples_in_record / r — and that must land on a
+ * common PSG rate (EEG, EOG, EMG, EKG, respiration, SpO2). The
+ * candidate where ALL signals' rates match is the writer's intended
+ * duration. Tie-break on longest: this field is most often zeroed by
+ * older PSG writers that used 10 s or 30 s records. Returns NaN +
+ * a diagnostic in info_out when no candidate matches.
+ */
+static double infer_record_duration(const int *samples_in_record, int n_signals,
+                                    char *info_out, size_t info_size)
+{
+    static const int candidates[]   = {1, 2, 4, 5, 10, 15, 20, 30, 60};
+    static const int common_rates[] = {1, 5, 10, 16, 25, 32, 50, 64, 100, 125, 128,
+                                       200, 250, 256, 400, 500, 512, 1000, 1024, 2000, 2048};
+    const int n_cand  = sizeof(candidates)   / sizeof(candidates[0]);
+    const int n_rates = sizeof(common_rates) / sizeof(common_rates[0]);
+
+    int fits[16];
+    int n_fits = 0;
+    for (int i = 0; i < n_cand; i++) {
+        int r = candidates[i];
+        int all_ok = 1;
+        for (int s = 0; s < n_signals; s++) {
+            double v = (double)samples_in_record[s] / (double)r;
+            if (fabs(v - round(v)) > 1e-6) { all_ok = 0; break; }
+            int matched = 0;
+            for (int k = 0; k < n_rates; k++) {
+                if (fabs((double)common_rates[k] - v) < 0.5) { matched = 1; break; }
+            }
+            if (!matched) { all_ok = 0; break; }
+        }
+        if (all_ok && n_fits < (int)(sizeof(fits)/sizeof(fits[0]))) {
+            fits[n_fits++] = r;
+        }
+    }
+
+    if (n_fits == 0) {
+        snprintf(info_out, info_size,
+                 "no candidate record duration mapped samples_in_record to common PSG rates");
+        return NAN;
+    }
+
+    int dur = fits[0];
+    for (int i = 1; i < n_fits; i++) if (fits[i] > dur) dur = fits[i];
+
+    if (n_fits > 1) {
+        char fits_str[96] = {0};
+        for (int i = 0; i < n_fits; i++) {
+            char tmp[16];
+            snprintf(tmp, sizeof(tmp), "%d%s", fits[i], (i < n_fits - 1) ? ", " : "");
+            strncat(fits_str, tmp, sizeof(fits_str) - strlen(fits_str) - 1);
+        }
+        snprintf(info_out, info_size, "%d s (candidates fit: %s; picked longest)",
+                 dur, fits_str);
+    } else {
+        snprintf(info_out, info_size, "%d s (unique fit)", dur);
+    }
+    return (double)dur;
+}
+
+/* ============================================================
  *                 EDF+ num_data_records FIX (plain only)
  * ============================================================
  *
@@ -607,67 +674,40 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     DBG("===========================\n\n");
 
     /* ============================================================
-     *      REPAIR MAIN HEADER (pre-signal-headers, plain only)
+     *      REPAIR num_header_bytes (pre-signal-headers, plain only)
      * ============================================================
      *
-     * num_header_bytes is deterministic from num_signals
-     * (256 main header + 256 per signal). data_record_duration is
-     * scientific metadata that can't be derived from file structure —
-     * fall back to `assumed_rec_dur` (default 1.0) and warn so the
-     * caller can verify against the recording. Both repairs need their
-     * dependency field non-zero; if those are also corrupt the ASSERTs
-     * below surface the error. Compressed inputs skip the on-disk
-     * write (can't rewrite a byte of a .gz/.zst in place) but the
-     * in-memory header is still patched.
+     * Deterministic from num_signals (256 main + 256 per signal). Has
+     * to run before signal headers are parsed below — `read_signal_headers`
+     * consumes (num_header_bytes - 256) bytes and silently does nothing
+     * when this field is zero. Compressed inputs skip the on-disk write
+     * but the in-memory header is still patched.
      */
     int repair = (nrhs > 4 && mxGetScalar(prhs[4]) != 0);
     double assumed_rec_dur = (nrhs > 6) ? mxGetScalar(prhs[6]) : 1.0;
 
-    if (repair) {
-        if (hdr.num_header_bytes == 0 && hdr.num_signals > 0) {
-            int expected_hb = 256 + 256 * hdr.num_signals;
-            if (rd.comp == COMP_NONE) {
-                FILE *fw = fopen(fname, "r+b");
-                if (fw) {
-                    char hb_str[9];
-                    snprintf(hb_str, 9, "%-8d", expected_hb);
-                    fseek(fw, 184, SEEK_SET);
-                    fwrite(hb_str, 1, 8, fw);
-                    fclose(fw);
-                    if (verbose)
-                        mexPrintf("Header repaired: num_header_bytes set to %d (= 256 + 256*%d signals).\n",
-                                  expected_hb, hdr.num_signals);
-                }
-            } else if (verbose) {
-                mexPrintf("RepairHeader requested for compressed input — patching in-memory only.\n");
+    if (repair && hdr.num_header_bytes == 0 && hdr.num_signals > 0) {
+        int expected_hb = 256 + 256 * hdr.num_signals;
+        if (rd.comp == COMP_NONE) {
+            FILE *fw = fopen(fname, "r+b");
+            if (fw) {
+                char hb_str[9];
+                snprintf(hb_str, 9, "%-8d", expected_hb);
+                fseek(fw, 184, SEEK_SET);
+                fwrite(hb_str, 1, 8, fw);
+                fclose(fw);
+                if (verbose)
+                    mexPrintf("Header repaired: num_header_bytes set to %d (= 256 + 256*%d signals).\n",
+                              expected_hb, hdr.num_signals);
             }
-            hdr.num_header_bytes = expected_hb;
+        } else if (verbose) {
+            mexPrintf("RepairHeader requested for compressed input — patching in-memory only.\n");
         }
-
-        if (hdr.data_record_duration == 0.0 && hdr.num_data_records > 0) {
-            if (rd.comp == COMP_NONE) {
-                FILE *fw = fopen(fname, "r+b");
-                if (fw) {
-                    char dur_str[9];
-                    snprintf(dur_str, 9, "%-8g", assumed_rec_dur);
-                    fseek(fw, 244, SEEK_SET);
-                    fwrite(dur_str, 1, 8, fw);
-                    fclose(fw);
-                    if (verbose)
-                        mexPrintf("Header repaired: data_record_duration set to %g (ASSUMED — pass AssumedRecordDuration to override).\n",
-                                  assumed_rec_dur);
-                }
-            }
-            hdr.data_record_duration = assumed_rec_dur;
-            mexWarnMsgIdAndTxt("read_EDF_mex:AssumedRecordDuration",
-                "data_record_duration was 0; assumed %g seconds/record. Verify against the recording metadata (typical lab values: 1, 10, 30).",
-                assumed_rec_dur);
-        }
+        hdr.num_header_bytes = expected_hb;
     }
 
     ASSERT(hdr.num_signals > 0);
     ASSERT(hdr.num_header_bytes >= 256);
-    ASSERT(hdr.data_record_duration > 0);
 
     /* ============================================================
      *                     READ SIGNAL HEADERS
@@ -675,6 +715,56 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 
     Signal_Header *sig = mxCalloc(hdr.num_signals, sizeof(Signal_Header));
     read_signal_headers(&rd, sig, hdr.num_signals);
+
+    /* ============================================================
+     *      REPAIR data_record_duration (post-signal-headers)
+     * ============================================================
+     *
+     * Infer from per-signal samples_in_record: the writer chose
+     * data_record_duration such that samples_in_record / duration
+     * lands on a common PSG sampling rate for every signal. If
+     * inference can't pick uniquely, fall back to `assumed_rec_dur`
+     * (default 1.0). The ASSERT(data_record_duration > 0) just below
+     * surfaces the rare case where neither path produces a valid value.
+     */
+    if (repair && hdr.data_record_duration == 0.0 && hdr.num_data_records > 0) {
+        int samples[256];
+        int n = hdr.num_signals < 256 ? hdr.num_signals : 256;
+        for (int i = 0; i < n; i++) samples[i] = sig[i].samples_in_record;
+
+        char info[160];
+        double inferred = infer_record_duration(samples, n, info, sizeof(info));
+        double new_dur;
+        const char *source;
+
+        if (!isnan(inferred)) {
+            new_dur = inferred;
+            source  = "derived from signal headers";
+        } else {
+            new_dur = assumed_rec_dur;
+            source  = "using AssumedRecordDuration (no unique inference)";
+            mexWarnMsgIdAndTxt("read_EDF_mex:AssumedRecordDuration",
+                "data_record_duration could not be inferred from signal headers; assumed %g s/record. Verify against the recording metadata.",
+                new_dur);
+        }
+
+        if (rd.comp == COMP_NONE) {
+            FILE *fw = fopen(fname, "r+b");
+            if (fw) {
+                char dur_str[9];
+                snprintf(dur_str, 9, "%-8g", new_dur);
+                fseek(fw, 244, SEEK_SET);
+                fwrite(dur_str, 1, 8, fw);
+                fclose(fw);
+                if (verbose)
+                    mexPrintf("Header repaired: data_record_duration set to %g (%s: %s).\n",
+                              new_dur, source, info);
+            }
+        }
+        hdr.data_record_duration = new_dur;
+    }
+
+    ASSERT(hdr.data_record_duration > 0);
 
     mwSize total_samp_per_rec = 0;
     int annot_idx = -1;
