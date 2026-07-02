@@ -2,7 +2,9 @@
 
 High-performance EDF / EDF+ reader **and writer** for MATLAB, with compiled MEX backends and pure-MATLAB fallbacks. Reads and writes plain `.edf`, gzip-compressed `.edf.gz`, and zstd-compressed `.edf.zst` (on the fly, no temp file). Bundled with `convert_EDF` (read → resample → write) and `batch_convert_EDF` (parallel multi-file pipeline), plus a `bin/convert_edf` shell CLI.
 
-Handles the things that break off-the-shelf EDF readers in practice: malformed record counts in clinical files, EDF+ TAL annotations, A-B rereferencing at load time, de-identification, compressed archives, anti-aliased resampling, and large polysomnography recordings where a naive loop is slow.
+Also bundles `EDF_join` (stitch a recording that was split across several files back into one continuous EDF, gap-filling any missing spans).
+
+Handles the things that break off-the-shelf EDF readers in practice: malformed record counts in clinical files, EDF+ TAL annotations, A-B rereferencing at load time, de-identification, compressed archives, anti-aliased resampling, split-file rejoining, and large polysomnography recordings where a naive loop is slow.
 
 Part of the Prerau Lab [`preraulab_utilities`](https://github.com/preraulab/preraulab_utilities) meta-repository. Can also be used standalone.
 
@@ -22,6 +24,10 @@ convert_EDF('sleep.edf', 128);
 
 % Batch a directory of EDFs, parallel
 result = batch_convert_EDF('/path/to/edfs', 128, 'OutputDir', '/path/out');
+
+% Join a split recording back into one continuous EDF (gaps zero-filled)
+EDF_join({'night_part1.edf', 'night_part2.edf', 'night_part3.edf'});
+% writes night_part1_joined.edf.zst
 ```
 
 From the shell (calls MATLAB):
@@ -533,6 +539,41 @@ What this means in practice:
 - **High-gamma analysis (60–90 Hz on a 200+ Hz target rate) or sharp-spike morphology**: the last few Hz before Nyquist may differ by O(1 µV). If you need bit-exact MATLAB-resample output, use the MATLAB pipeline.
 - **Round-trip / archival**: the two outputs are not byte-identical. They are scientifically equivalent within the band of interest for sleep work, but downstream analyses that hash or diff signal arrays will not match across the two pipelines.
 
+### Join split EDFs into one continuous file
+
+Clinical acquisitions are often written as several EDF files (a new file every few hours, or a fresh file after each amplifier restart), sometimes with gaps between them. `EDF_join` reads a list of these segments, orders them by recording start date/time, checks that they belong together, and writes **one continuous EDF** covering the full span — with any gap between segments filled by a constant blank value (0 in physical units by default) so every sample from the earliest start to the latest end is present and correctly time-aligned.
+
+```matlab
+% Explicit list (order doesn't matter — sorted by start time)
+EDF_join({'night_part1.edf', 'night_part2.edf', 'night_part3.edf'});
+% writes night_part1_joined.edf.zst next to the first file
+
+% A whole directory, plain-.edf output at a chosen path, with a summary
+EDF_join('/data/split_night', ...
+    'CompressMode', 'none', 'OutputName', '/data/night_full.edf', ...
+    'Verbose', true);
+
+% Headers have missing/unreliable dates — supply start times explicitly
+EDF_join({'a.edf', 'b.edf'}, ...
+    'StartTimes', {datetime(2024,3,1,22,0,0), datetime(2024,3,1,23,5,0)});
+
+% Also capture the assembled structures without re-reading the output
+[out_path, header, signal_header, signal_cell, annotations] = EDF_join(files);
+```
+
+Inputs follow the same conventions as `batch_convert_EDF`: a cell array of paths, a directory (globbed with `'Pattern'`), or a `.txt`/`.list` file with one path per line. `.edf`, `.edf.gz`, and `.edf.zst` segments are all accepted.
+
+**What it verifies (hard errors unless noted):**
+
+- **Ordering** — segments are sorted by start datetime, taken from the EDF+ `Startdate DD-MMM-YYYY` token in `local_rec_id` when present (unambiguous 4-digit year), otherwise from the main-header `dd.mm.yy` date (EDF 1985 century rule) plus `recording_starttime`. A missing/invalid start time errors unless supplied via `'StartTimes'`.
+- **Record grid** — `data_record_duration` must match across segments, and each segment must begin an integer number of records after the earliest start, so all samples land on one shared record grid. A non-integer offset larger than `'Tolerance'` (default 1 ms) errors — the segments cannot be tiled exactly.
+- **No overlap** — segment time ranges may touch end-to-start (a seamless join) but must not overlap. Any overlap beyond `'Tolerance'` errors, since overlapping samples would be ambiguous.
+- **Identical montage** — the ordered non-annotation channel labels must match across all segments, and each channel's `samples_in_record` (hence sampling rate) must match. Differing physical/digital ranges are a **warning** (they get re-quantized into the first segment's range under `'AutoScale', 'preserve'`; pass `'recompute'` to size the range from the joined data instead).
+
+Gaps between segments are filled with `'FillValue'` (physical units, default 0) on every non-annotation channel. EDF+ annotations from all segments are merged, with each segment's onsets shifted onto the joined timeline; `write_EDF` regenerates the annotation channel for the full continuous span.
+
+`EDF_join` reads every segment fully into memory and assembles the joined recording before writing, so peak memory is roughly the input total plus the output. For very large cohorts, join in groups.
+
 ### Inspect the header in a GUI
 
 ```matlab
@@ -565,6 +606,7 @@ What this means in practice:
 | `write_EDF_mex.mexmaca64` | Pre-built write MEX for Apple Silicon |
 | `convert_EDF.m` | Read → resample → write helper (one file) |
 | `batch_convert_EDF.m` | Multi-file driver with `parfor` and per-file error handling |
+| `EDF_join.m` | Stitch split EDF segments into one continuous file (sort by start time, verify montage/overlap, gap-fill) |
 | `bin/convert_edf` | POSIX shell wrapper for `batch_convert_EDF` |
 | `compile_edf_mex.m` | Shared auto-compile helper (vendored zlib + system libzstd) |
 | `zlib/` | Vendored zlib 1.3.2 source (BSD-style license). Compiled into both MEX files so there's no system zlib dependency. |
