@@ -254,6 +254,7 @@ typedef struct {
 
 typedef struct {
     double onset;
+    double duration;   /* EDF+ TAL duration; NaN when the TAL omits one */
     mxArray *texts;
 } Annotation;
 
@@ -499,12 +500,30 @@ static void parse_tal_block_fast(
 
         if (buf[i] != '+' && buf[i] != '-') { i++; continue; }
 
+        /* EDF+ TAL onset field: Onset [ 0x15 Duration ] 0x14 Text ...
+         * Stop the onset at the duration separator (0x15) OR the text
+         * marker (0x14). atof() would tolerate a glued-on "<0x15>Dur"
+         * tail, but scanning it explicitly lets us also capture the
+         * duration and keeps parity with the pure-MATLAB reader. */
         char onset_str[64];
         mwSize j = 0;
-        while (i < len && buf[i] != 20 && j < sizeof(onset_str)-1)
+        while (i < len && buf[i] != 20 && buf[i] != 21 && j < sizeof(onset_str)-1)
             onset_str[j++] = buf[i++];
         onset_str[j] = '\0';
         if (i >= len) break;
+
+        /* Optional duration field (0x15 Duration). NaN when absent. */
+        double duration = mxGetNaN();
+        if (buf[i] == 21) {
+            i++; /* skip 0x15 */
+            char dur_str[64];
+            mwSize d = 0;
+            while (i < len && buf[i] != 20 && d < sizeof(dur_str)-1)
+                dur_str[d++] = buf[i++];
+            dur_str[d] = '\0';
+            if (i >= len) break;
+            duration = atof(dur_str);
+        }
         i++; /* skip 0x14 */
 
         char **texts = NULL;
@@ -528,7 +547,8 @@ static void parse_tal_block_fast(
 
         if (ntext > 0) {
             *out = mxRealloc(*out, (*count + 1) * sizeof(Annotation));
-            (*out)[*count].onset = atof(onset_str);
+            (*out)[*count].onset    = atof(onset_str);
+            (*out)[*count].duration = duration;
 
             mxArray *cell = mxCreateCellMatrix(1, ntext);
             for (mwSize t = 0; t < ntext; t++) {
@@ -1144,17 +1164,18 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
      * ============================================================ */
 
     if (nlhs >= 4) {
-        const char *f[] = {"onset", "text"};
+        const char *f[] = {"onset", "duration", "text"};
         mxArray *A;
 
         if (acount > 0) {
-            A = mxCreateStructMatrix(acount, 1, 2, f);
+            A = mxCreateStructMatrix(acount, 1, 3, f);
             for (mwSize i = 0; i < acount; i++) {
-                mxSetField(A, i, "onset", mxCreateDoubleScalar(alist[i].onset));
-                mxSetField(A, i, "text",  alist[i].texts);
+                mxSetField(A, i, "onset",    mxCreateDoubleScalar(alist[i].onset));
+                mxSetField(A, i, "duration", mxCreateDoubleScalar(alist[i].duration));
+                mxSetField(A, i, "text",     alist[i].texts);
             }
         } else {
-            A = mxCreateStructMatrix(0, 0, 2, f);
+            A = mxCreateStructMatrix(0, 0, 3, f);
         }
 
         if (alist) mxFree(alist);

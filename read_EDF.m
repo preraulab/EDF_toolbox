@@ -89,7 +89,10 @@ function varargout = read_EDF(edf_fname, varargin)
 %       signal_header : struct array of per-signal headers
 %       signal_cell   : cell array, one signal vector per channel,
 %                       in physical units (scaled and offset)
-%       annotations   : struct array of EDF+ annotations
+%       annotations   : struct array of EDF+ annotations, with fields
+%                       'onset' (seconds), 'duration' (seconds, NaN when
+%                       the annotation has no duration), and 'text' (cell
+%                       array of annotation strings for that timestamp)
 %
 %   -------------------------------------------------------------------------
 %   Re-referencing on load
@@ -1104,7 +1107,7 @@ end
 %  EDF+ ANNOTATION PARSER — exclude blank annotation texts
 % =========================================================================
 function annotations = extractAnnotations(edf_fname, header, signal_header)
-annotations = struct('onset', {}, 'text', {});
+annotations = struct('onset', {}, 'duration', {}, 'text', {});
 annotIdx = find(strcmp(strtrim({signal_header.signal_labels}), 'EDF Annotations'), 1);
 if isempty(annotIdx), return; end
 
@@ -1132,6 +1135,7 @@ if ~isempty(allAnnotations)
     valid = allAnnotations(mask);
     if ~isempty(valid)
         annotations = struct('onset', num2cell([valid.onset])', ...
+            'duration', num2cell([valid.duration])', ...
             'text', {valid.texts}');
     end
 end
@@ -1152,13 +1156,32 @@ while idx <= length(data)
     if data(idx) ~= 43 && data(idx) ~= 45  % '+' or '-'
         idx = idx + 1; continue;
     end
+    % EDF+ TAL onset field: Onset [ 0x15 Duration ] 0x14 Text ...
+    % The onset ends at EITHER the duration separator (0x15 = 21) or the
+    % text marker (0x14 = 20). Stopping only at 0x14 (the old bug) glued
+    % the "<0x15>Duration" onto the onset string; str2double then rejects
+    % the whole thing and returns NaN for every annotation that carries a
+    % duration (e.g. 30 s sleep-stage epochs). The MEX reader survived
+    % this only because C's atof() stops at the first non-numeric byte.
     onsetStart = idx;
-    while idx <= length(data) && data(idx) ~= 20
+    while idx <= length(data) && data(idx) ~= 20 && data(idx) ~= 21
         idx = idx + 1;
     end
     if idx > length(data), break; end
     onset = str2double(char(data(onsetStart:idx-1))');
-    idx = idx + 1;
+    % Optional duration field (0x15 Duration) sits between the onset and the
+    % 0x14 text marker. NaN when absent — an EDF+ event with no stated span.
+    duration = nan;
+    if data(idx) == 21
+        idx = idx + 1;                                   % skip 0x15
+        durStart = idx;
+        while idx <= length(data) && data(idx) ~= 20
+            idx = idx + 1;                               % scan duration digits
+        end
+        if idx > length(data), break; end
+        duration = str2double(char(data(durStart:idx-1))');
+    end
+    idx = idx + 1;                                       % skip 0x14
 
     texts = {};
     while idx <= length(data) && data(idx) ~= 0
@@ -1172,7 +1195,7 @@ while idx <= length(data)
         end
     end
     if any(~cellfun(@isempty, strtrim(texts)))
-        tals = [tals; struct('onset', onset, 'texts', {texts})];
+        tals = [tals; struct('onset', onset, 'duration', duration, 'texts', {texts})];
     end
     idx = idx + 1;
 end
