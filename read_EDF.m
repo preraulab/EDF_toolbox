@@ -64,9 +64,25 @@ function varargout = read_EDF(edf_fname, varargin)
 %                        inputs are decompressed to a temp file in this
 %                        path and auto-cleaned-up on return.
 %       'debug'        : logical - debug mode for MEX (default false)
-%       'deidentify'   : logical - blank PHI fields and save a
-%                        '_deidentified' copy (default false; ignored
-%                        with a warning for compressed inputs).
+%       'deidentify'   : logical - blank PHI fields in the EDF header
+%                        (default false; ignored with a warning for
+%                        compressed inputs). See 'DeidentifyMode' for
+%                        whether this patches a copy or the original.
+%       'DeidentifyMode' : char - what file the blanked header lands in
+%                        (default 'copy'):
+%                          'copy'      - duplicate the whole file and
+%                                        patch the '_deidentified' copy;
+%                                        original untouched. Slow for
+%                                        large files (full-file copy).
+%                          'overwrite' - patch the original file's
+%                                        header in place. Near-instant
+%                                        (writes 168 header bytes), but
+%                                        PHI in the original is gone.
+%                          'overwriteandrename' - patch in place, then
+%                                        rename the file itself to the
+%                                        '_deidentified' name. Also
+%                                        near-instant (rename is a
+%                                        metadata operation).
 %
 %   Outputs:
 %       header        : struct of EDF file-level metadata
@@ -335,6 +351,11 @@ addParameter(p, 'AssumedRecordDuration', 1.0, @(x) isnumeric(x) && isscalar(x) &
 addParameter(p, 'forceMATLAB', false, @islogical);
 addParameter(p, 'debug', false, @islogical);
 addParameter(p, 'deidentify', false, @islogical);
+% 'copy' duplicates the file before patching (safe, slow on large PSGs);
+% the overwrite modes patch the 168 PHI header bytes in the original
+% (near-instant, but destructive to the source header by design).
+addParameter(p, 'DeidentifyMode', 'copy', ...
+    @(s) any(validatestring(s, {'copy', 'overwrite', 'overwriteandrename'})));
 % TargetFs: resample every raw signal to this rate BEFORE running the
 % derived pipeline. Required when References combine constituents at
 % different native rates -- apply_channel_derivations rejects mixed
@@ -352,6 +373,9 @@ assumed_rec_dur = p.Results.AssumedRecordDuration;
 force_matlab    = p.Results.forceMATLAB;
 debug           = p.Results.debug;
 deidentify      = p.Results.deidentify;
+% Canonicalize case/partial forms once so downstream switches are exact.
+deid_mode       = validatestring(p.Results.DeidentifyMode, ...
+    {'copy', 'overwrite', 'overwriteandrename'});
 target_fs       = p.Results.TargetFs;
 
 % Decide whether to route through the derived-channels post-processing
@@ -449,7 +473,7 @@ end
 
 %% ---------------- MATLAB FALLBACK ----------------
 if ~mex_succeeded
-    [varargout{1:backend_nargout}] = read_EDF_matlab(edf_fname, backend_channels, epochs, verbose, repair_header, deidentify);
+    [varargout{1:backend_nargout}] = read_EDF_matlab(edf_fname, backend_channels, epochs, verbose, repair_header, deidentify, deid_mode);
 end
 
 %% ---------------- TARGET-FS RESAMPLE (pre-derive) ----------------
@@ -492,7 +516,7 @@ end
 % deidentify modifies the file on disk; only meaningful when the MEX
 % backend succeeded (the MATLAB fallback already handles it inline).
 if mex_succeeded && deidentify
-    deidentify_edf(edf_fname, repair_header, verbose);
+    deidentify_edf(edf_fname, repair_header, verbose, deid_mode);
 end
 
 % Restore the caller's nargout. backend_nargout may have been bumped
@@ -509,7 +533,7 @@ end
 %% =========================================================================
 %  PURE MATLAB EDF READER
 % =========================================================================
-function varargout = read_EDF_matlab(edf_fname, channels, epochs, verbose, repair_header, deidentify)
+function varargout = read_EDF_matlab(edf_fname, channels, epochs, verbose, repair_header, deidentify, deid_mode)
 
 % If input is compressed, decompress to a temp .edf and run the rest
 % against it. Temp directory is removed when this function returns.
@@ -804,7 +828,7 @@ annotations = extractAnnotations(edf_fname, header, signal_header);
 
 %% ---------------- DEIDENTIFY ----------------
 if deidentify
-    deidentify_edf(edf_fname, repair_header, verbose);
+    deidentify_edf(edf_fname, repair_header, verbose, deid_mode);
 
     % Also scrub the returned header struct so it matches the written file
     header.patient_id        = 'X X X X';
@@ -986,8 +1010,29 @@ end
 %% =========================================================================
 %  DEIDENTIFY HELPER — copy file with PHI fields blanked in the header
 % =========================================================================
-function deidentify_edf(edf_fname, repair_header, verbose)
-% Build output filename with appropriate suffix
+function deidentify_edf(edf_fname, repair_header, verbose, deid_mode)
+%DEIDENTIFY_EDF  Blank PHI header fields per the selected DeidentifyMode
+%
+%   Inputs:
+%       edf_fname     : char - path to the plain .edf file -- required
+%       repair_header : logical - true adds '_fixed' to the output
+%                       suffix -- required
+%       verbose       : logical - print the resulting filename -- required
+%       deid_mode     : char - 'copy' | 'overwrite' |
+%                       'overwriteandrename' (canonicalized by the
+%                       caller) -- required
+%
+%   Outputs:
+%       none (side effects only: writes/renames files on disk)
+%
+%   Notes:
+%       Only 168 bytes of the fixed 256-byte EDF main header ever change
+%       (patient_id, local_rec_id, recording_startdate), so the patch
+%       itself is near-instant regardless of file size. 'copy' pays for
+%       a full-file duplicate before patching; the overwrite modes do
+%       not, which is the whole point of offering them.
+
+% Build the '_deidentified' sibling name used by copy / overwriteandrename
 [fdir, fname, fext] = fileparts(edf_fname);
 if repair_header
     out_fname = fullfile(fdir, [fname '_fixed_deidentified' fext]);
@@ -995,13 +1040,22 @@ else
     out_fname = fullfile(fdir, [fname '_deidentified' fext]);
 end
 
-% Copy the entire file first, then patch header fields in the copy
-copyfile(edf_fname, out_fname);
+switch deid_mode
+    case 'copy'
+        % Duplicate the whole file, then patch the copy. Original untouched.
+        copyfile(edf_fname, out_fname);
+        patch_fname = out_fname;
+    otherwise
+        % 'overwrite' / 'overwriteandrename': patch the original in place.
+        % The rename (if any) happens after a successful patch, so a failed
+        % patch never leaves a '_deidentified'-named file with PHI intact.
+        patch_fname = edf_fname;
+end
 
-fw = fopen(out_fname, 'r+', 'ieee-le');
+fw = fopen(patch_fname, 'r+', 'ieee-le');
 if fw < 0
     warning('read_EDF:DeidentifyFailed', ...
-        'Could not open output file for deidentification: %s', out_fname);
+        'Could not open file for deidentification: %s', patch_fname);
     return
 end
 
@@ -1031,6 +1085,14 @@ for k = 1:size(phi_fields, 1)
 end
 
 fclose(fw);
+
+switch deid_mode
+    case 'overwrite'
+        % Header patched in place; the file keeps its original name.
+        out_fname = edf_fname;
+    case 'overwriteandrename'
+        movefile(edf_fname, out_fname);
+end
 
 if verbose
     fprintf('Deidentified file written: %s\n', out_fname);

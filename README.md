@@ -62,7 +62,7 @@ cd rust && cargo build --release
 | **Epoch subsetting** | Load only a `[start_epoch end_epoch]` slice |
 | **EDF+ annotations** | Parse TAL (Time-Annotation List) format |
 | **Header repair** | Correct invalid `num_data_records` and save a `_fixed` copy (plain `.edf` only) |
-| **De-identification** | Strip PHI fields and save a `_deidentified` copy (plain `.edf` only) |
+| **De-identification** | Blank PHI fields — in a `_deidentified` copy, or in place (near-instant on any file size) via `DeidentifyMode` (plain `.edf` only) |
 | **Digital → physical scaling** | `phys_val = phys_min + (dig_val - dig_min) × (phys_max - phys_min) / (dig_max - dig_min)` — done correctly per-channel |
 | **Streaming I/O** | Reads and writes record-by-record; peak memory is ~one record + the output arrays, even for multi-GB files |
 | **Write side** | `write_EDF` mirrors `read_EDF`; same struct shapes round-trip through `read → write → read` to within ~1 digital LSB |
@@ -217,9 +217,29 @@ Clinical EDFs sometimes have invalid `num_data_records` — the field says one n
 
 ### De-identify
 
+Blanks the three PHI header fields (patient id, recording id, start date — 168 bytes total). `DeidentifyMode` controls where the blanked header lands:
+
 ```matlab
+% Default 'copy': duplicate the file, patch the copy. Original untouched.
+% Slow for large files — the copy is ~100% of the runtime (a 2 GB PSG on a
+% Windows disk or network share copies at raw disk speed).
 [~, ~, ~] = read_EDF('patient.edf', 'deidentify', true);
 % Writes patient_deidentified.edf with PHI fields blanked
+
+% 'overwrite': patch the original's header in place. Near-instant at any
+% file size (writes only the 168 header bytes), but the PHI in the
+% original is gone — that's the point.
+[~, ~, ~] = read_EDF('patient.edf', 'deidentify', true, 'DeidentifyMode', 'overwrite');
+
+% 'overwriteandrename': patch in place, then rename the file itself to
+% patient_deidentified.edf. Also near-instant (rename is metadata-only).
+[~, ~, ~] = read_EDF('patient.edf', 'deidentify', true, 'DeidentifyMode', 'overwriteandrename');
+```
+
+The Rust CLI exposes the same three modes (same tokens, byte-identical results) as a standalone operation — handy for de-identifying whole directories without MATLAB:
+
+```bash
+./convert_edf --deidentify overwriteandrename /path/to/edfs -R
 ```
 
 ### Force pure-MATLAB path (disable MEX)
@@ -465,6 +485,19 @@ Codec, parallelism, and verbosity work the same regardless of input shape:
 ./convert_edf -F 100 --out /out -v /in
 ```
 
+**De-identify (no conversion).** `--deidentify <MODE>` blanks the PHI header fields (patient id, recording id, start date) of every input instead of converting — same modes, tokens, and byte-level results as MATLAB `read_EDF`'s `DeidentifyMode`. Plain `.edf` only (compressed inputs are skipped with a warning); `--target-rate` is not required. Already-`_deidentified` files found in directory walks are skipped, so re-runs are idempotent.
+
+```sh
+# Safe default: write foo_deidentified.edf next to each foo.edf (full copy — slow on big files)
+./convert_edf --deidentify copy -R /data/study_root
+
+# Patch headers in place: near-instant regardless of file size
+./convert_edf --deidentify overwrite -R /data/study_root
+
+# Patch in place, then rename each file to <stem>_deidentified.edf
+./convert_edf --deidentify overwriteandrename -R /data/study_root
+```
+
 **Existing-output handling.** By default, if the intended output file already exists the input is skipped with a one-line warning — safe behavior for shared NFS data dirs. Three mutually-exclusive overrides (cp idiom):
 
 ```sh
@@ -592,7 +625,8 @@ Gaps between segments are filled with `'FillValue'` (physical units, default 0) 
 | `RepairHeader` | logical | `false` | Fix invalid `num_data_records`, write `_fixed.edf` |
 | `forceMATLAB` | logical | `false` | Disable MEX, use pure MATLAB reader |
 | `debug` | logical | `false` | Verbose MEX diagnostics |
-| `deidentify` | logical | `false` | Blank PHI fields, write `_deidentified.edf` |
+| `deidentify` | logical | `false` | Blank PHI fields (see `DeidentifyMode` for where) |
+| `DeidentifyMode` | char | `'copy'` | `'copy'` (patch a `_deidentified` copy), `'overwrite'` (patch original in place, near-instant), `'overwriteandrename'` (patch in place + rename to `_deidentified`) |
 
 ## Files
 

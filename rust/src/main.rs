@@ -44,6 +44,22 @@ enum AutoScale {
     Recompute,
 }
 
+/// Where the blanked PHI header lands in `--deidentify` mode. Mirrors the
+/// MATLAB read_EDF 'DeidentifyMode' option (same tokens, same semantics).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum DeidentifyMode {
+    /// Duplicate the file and patch the `_deidentified` copy; original
+    /// untouched. Slow for large files (pays a full-file copy).
+    Copy,
+    /// Patch the original file's header in place. Near-instant (writes
+    /// 168 header bytes), but PHI in the original is gone.
+    Overwrite,
+    /// Patch in place, then rename the file to `<stem>_deidentified.edf`.
+    /// Also near-instant (rename is a metadata operation).
+    #[value(name = "overwriteandrename", alias = "overwrite-and-rename")]
+    OverwriteAndRename,
+}
+
 /// Policy for what to do when an intended output path already exists.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ClobberPolicy {
@@ -127,6 +143,17 @@ struct Args {
     /// and print the elapsed wall time. No output is written.
     #[arg(long, default_value_t = false)]
     read_bench: bool,
+
+    /// De-identify instead of converting: blank the PHI header fields
+    /// (patient id, recording id, start date) of every input, exactly as
+    /// MATLAB read_EDF's 'deidentify' option does. Plain .edf only —
+    /// compressed inputs are skipped with a warning. No resampling or
+    /// conversion is performed; --target-rate is not required. Modes:
+    ///   copy               — patch a `_deidentified` copy (original kept)
+    ///   overwrite          — patch the original header in place
+    ///   overwriteandrename — patch in place, rename to `_deidentified`
+    #[arg(long, value_enum)]
+    deidentify: Option<DeidentifyMode>,
 
     /// Output file (single-file input only) or output directory (multi-file
     /// or directory inputs). When mirroring directory structure, this is the
@@ -235,8 +262,8 @@ fn main() -> Result<()> {
     if roots.is_empty() {
         bail!("no inputs given (pass one or more FILE / DIR arguments)");
     }
-    if !args.read_bench && args.target_rate <= 0.0 {
-        bail!("--target-rate / -F is required (or pass --read-bench to skip conversion)");
+    if !args.read_bench && args.deidentify.is_none() && args.target_rate <= 0.0 {
+        bail!("--target-rate / -F is required (or pass --read-bench / --deidentify to skip conversion)");
     }
 
     // Resolve `--jobs 0` to a memory-aware default. See Args::jobs docs.
@@ -269,6 +296,10 @@ fn main() -> Result<()> {
 
     if args.read_bench {
         return run_read_bench_pairs(&pairs);
+    }
+
+    if let Some(mode) = args.deidentify {
+        return run_deidentify_pairs(&pairs, mode, args.verbose);
     }
 
     if pairs.is_empty() {
@@ -577,6 +608,157 @@ fn run_read_bench_pairs(pairs: &[(PathBuf, PathBuf)]) -> Result<()> {
         total_input_bytes,
         mb_per_s
     );
+    Ok(())
+}
+
+/// Suffix appended to filenames produced by `--deidentify` copy / rename
+/// modes. Matches the MATLAB read_EDF deidentify naming.
+const DEID_SUFFIX: &str = "_deidentified";
+
+/// `foo.edf` -> `foo_deidentified.edf` (same directory).
+fn deidentified_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut name = format!("{stem}{DEID_SUFFIX}");
+    if let Some(ext) = path.extension() {
+        name.push('.');
+        name.push_str(&ext.to_string_lossy());
+    }
+    path.with_file_name(name)
+}
+
+/// Blank the PHI fields of an EDF main header in place: patient_id
+/// (offset 8, 80 bytes), local recording id (88, 80), and recording
+/// start date (168, 8). Values and offsets match MATLAB read_EDF's
+/// deidentify_edf helper exactly. Refuses files that don't start with
+/// the EDF version field ("0" + spaces) — the overwrite modes are
+/// destructive, so we won't scribble on something that isn't an EDF.
+fn patch_phi_header(path: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open for header patch: {}", path.display()))?;
+
+    let mut version = [0u8; 8];
+    f.read_exact(&mut version)
+        .with_context(|| format!("read EDF version field: {}", path.display()))?;
+    // Spec says "0" + 7 spaces; some writers leave the field blank. Either
+    // is acceptable — anything else (gzip/zstd magic, random binary) is not.
+    if version[0] != b'0' && version != *b"        " {
+        bail!(
+            "{}: does not look like an EDF (version field is not '0'); refusing to patch",
+            path.display()
+        );
+    }
+
+    const FIELDS: [(&str, u64, usize); 3] = [
+        ("X X X X", 8, 80),            // patient_id
+        ("Startdate X X X X", 88, 80), // local_rec_id
+        ("01.01.01", 168, 8),          // recording_startdate
+    ];
+    for (val, offset, width) in FIELDS {
+        // Left-justify, space-pad to the exact field width (EDF headers
+        // are fixed-width ASCII).
+        let mut buf = vec![b' '; width];
+        let bytes = val.as_bytes();
+        let n = bytes.len().min(width);
+        buf[..n].copy_from_slice(&bytes[..n]);
+        f.seek(SeekFrom::Start(offset))?;
+        f.write_all(&buf)?;
+    }
+    f.sync_all()
+        .with_context(|| format!("flush header patch: {}", path.display()))?;
+    Ok(())
+}
+
+/// `--deidentify` operation mode: blank PHI header fields in every input
+/// per `mode`. Sequential (the work is a few hundred bytes per file;
+/// only 'copy' mode moves real data, and that is disk-bound anyway).
+/// Per-file failures warn and continue so one bad file doesn't strand a
+/// batch; a nonzero failure count is reported and returned as an error.
+fn run_deidentify_pairs(
+    pairs: &[(PathBuf, PathBuf)],
+    mode: DeidentifyMode,
+    verbose: bool,
+) -> Result<()> {
+    if pairs.is_empty() {
+        bail!("no .edf files found");
+    }
+    let mut done = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    for (_root, input) in pairs {
+        let lower = input.to_string_lossy().to_ascii_lowercase();
+        if lower.ends_with(".gz") || lower.ends_with(".zst") {
+            eprintln!(
+                "[skip] {}: deidentify requires a plain .edf (decompress first)",
+                input.display()
+            );
+            skipped += 1;
+            continue;
+        }
+        // Idempotency on re-runs over the same tree: an already-suffixed
+        // file would otherwise gain a second suffix in copy/rename modes.
+        if lower
+            .strip_suffix(".edf")
+            .is_some_and(|stem| stem.ends_with(DEID_SUFFIX))
+        {
+            if verbose {
+                eprintln!("[skip] {}: already {}", input.display(), DEID_SUFFIX);
+            }
+            skipped += 1;
+            continue;
+        }
+
+        let result: Result<PathBuf> = (|| match mode {
+            DeidentifyMode::Copy => {
+                let out = deidentified_path(input);
+                std::fs::copy(input, &out)
+                    .with_context(|| format!("copy to {}", out.display()))?;
+                patch_phi_header(&out)?;
+                Ok(out)
+            }
+            DeidentifyMode::Overwrite => {
+                patch_phi_header(input)?;
+                Ok(input.clone())
+            }
+            DeidentifyMode::OverwriteAndRename => {
+                // Patch first, then rename: a failed patch never leaves a
+                // '_deidentified'-named file with PHI intact.
+                patch_phi_header(input)?;
+                let out = deidentified_path(input);
+                std::fs::rename(input, &out)
+                    .with_context(|| format!("rename to {}", out.display()))?;
+                Ok(out)
+            }
+        })();
+
+        match result {
+            Ok(out) => {
+                if verbose {
+                    println!("deidentified: {}", out.display());
+                }
+                done += 1;
+            }
+            Err(e) => {
+                eprintln!("[fail] {}: {:#}", input.display(), e);
+                failed += 1;
+            }
+        }
+    }
+
+    println!(
+        "deidentified {} file(s), {} skipped, {} failed",
+        done, skipped, failed
+    );
+    if failed > 0 {
+        bail!("{failed} file(s) failed to deidentify");
+    }
     Ok(())
 }
 
