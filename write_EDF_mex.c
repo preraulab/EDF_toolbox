@@ -21,7 +21,11 @@
  *   length == samples_in_record * num_data_records).
  *
  * Compilation:
- *   mex -O -largeArrayDims -Izlib write_EDF_mex.c zlib/(asterisk).c -lzstd
+ *   mex -O -largeArrayDims -Izlib -Izstd write_EDF_mex.c zlib/(asterisk).c zstd/zstd.c
+ *
+ *   zlib and zstd are bundled as source (zlib/ and zstd/ subdirs), so no
+ *   system libraries are needed on any platform, including Windows.
+ *   compile_edf_mex.m wires up the paths automatically.
  */
 
 #include "mex.h"

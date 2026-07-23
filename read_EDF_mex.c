@@ -20,13 +20,13 @@
  *   value over whatever inference produces.
  *
  * Compilation:
- *   mex -O -largeArrayDims read_EDF_mex.c -lz -lzstd
+ *   mex -O -largeArrayDims -Izlib -Izstd read_EDF_mex.c zlib/(asterisk).c zstd/zstd.c
  *
  *   -largeArrayDims is REQUIRED.
- *   -lz links against system zlib (present on macOS via the Xcode SDK and
- *   on most Linux distributions). -lzstd links against libzstd (Homebrew
- *   on macOS, libzstd-dev on Linux). compile_edf_mex.m wires up the
- *   include/library paths automatically.
+ *   zlib and zstd are bundled as source (zlib/ and zstd/ subdirs), so no
+ *   system libraries are needed on any platform, including Windows.
+ *   compile_edf_mex.m wires up the paths automatically (and can fall back
+ *   to system -lz / -lzstd if the bundled dirs are removed).
  *
  * Notes on compressed inputs:
  *   • RepairHeader is silently skipped for .gz / .zst inputs — we cannot

@@ -409,7 +409,15 @@ end
 mex_succeeded = false;
 if ~force_matlab
     if ~mex_exists
-        compile_edf_mex(script_dir, 'read_EDF_mex.c');
+        % Compile failure (e.g. no C compiler configured) must not be
+        % fatal: warn with the fix and drop to the MATLAB reader below.
+        try
+            compile_edf_mex(script_dir, 'read_EDF_mex.c');
+        catch ME
+            warning('read_EDF:MexCompileFailed', ...
+                'Could not compile MEX backend, using slower pure-MATLAB reader.\n%s', ...
+                ME.message);
+        end
     end
     try
         [varargout{1:backend_nargout}] = read_EDF_mex(edf_fname, backend_channels, epochs, verbose, repair_header, debug, assumed_rec_dur);

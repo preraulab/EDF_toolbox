@@ -608,18 +608,29 @@ Gaps between segments are filled with `'FillValue'` (physical units, default 0) 
 | `batch_convert_EDF.m` | Multi-file driver with `parfor` and per-file error handling |
 | `EDF_join.m` | Stitch split EDF segments into one continuous file (sort by start time, verify montage/overlap, gap-fill) |
 | `bin/convert_edf` | POSIX shell wrapper for `batch_convert_EDF` |
-| `compile_edf_mex.m` | Shared auto-compile helper (vendored zlib + system libzstd) |
+| `compile_edf_mex.m` | Shared auto-compile helper (vendored zlib + vendored zstd) |
 | `zlib/` | Vendored zlib 1.3.2 source (BSD-style license). Compiled into both MEX files so there's no system zlib dependency. |
+| `zstd/` | Vendored zstd 1.5.7 single-file amalgamation (BSD license). Compiled into both MEX files so there's no system libzstd dependency — including on Windows. |
 | `header_gui.m` | Optional UI for inspecting header + signal-header tables |
 | `rust/` | Optional standalone Rust port of the read → resample → write pipeline. Roughly 3× faster than the MATLAB pipeline on the same hardware; useful for one-shot batch conversion of large corpora. Build with `cd rust && cargo build --release`. |
 
-If a pre-built MEX isn't available for your platform (Linux, Windows), `read_EDF.m` and `write_EDF.m` will auto-compile on first call. The build pulls in the vendored zlib (no system dep) and links against the system **libzstd** for `.edf.zst` support — the auto-compile script searches `/opt/homebrew` and `/usr/local` for it. To rebuild manually:
+If a pre-built MEX isn't available for your platform (Linux, Windows), `read_EDF.m` and `write_EDF.m` will auto-compile on first call. The build pulls in the vendored zlib **and** vendored zstd sources, so **no system libraries are required on any platform** — the only prerequisite is a C compiler configured for MEX. If compilation fails, the toolbox warns and falls back to the (slower) pure-MATLAB backend, so nothing breaks. To rebuild manually:
 
 ```matlab
 % From the EDF_toolbox directory
 compile_edf_mex(pwd, 'read_EDF_mex.c');
 compile_edf_mex(pwd, 'write_EDF_mex.c');
 ```
+
+### Windows setup
+
+No libraries need to be installed — zlib and zstd are compiled in from the bundled sources. You only need a C compiler for MEX, one-time:
+
+1. In MATLAB: **Home tab → Add-Ons → Get Add-Ons**, search for **"MinGW"**, and install *MATLAB Support for MinGW-w64 C/C++ Compiler* (free).
+2. Run `mex -setup C` in the Command Window.
+3. Call `read_EDF` / `write_EDF` — the MEX backends compile automatically on first use (producing `read_EDF_mex.mexw64` / `write_EDF_mex.mexw64`).
+
+Visual Studio's C++ compiler (any recent MSVC) works too if already installed. Until a compiler is set up, everything still runs via the pure-MATLAB fallback, just slower.
 
 ## Install
 
@@ -633,7 +644,7 @@ When used as part of `preraulab_utilities`, the top-level path setup handles thi
 
 - **MATLAB R2020a or later**
 - **No required toolboxes** for the core `read_EDF.m`
-- **libzstd** (only when (re)building the MEX — pre-built `.mexmaca64` files are committed). On macOS: `brew install zstd`. On Debian/Ubuntu: `apt install libzstd-dev`. On RHEL: `dnf install libzstd-devel`.
+- **No system compression libraries** — zlib and zstd are vendored in `zlib/` and `zstd/` and compiled into the MEX files on every platform
 - `header_gui.m` requires `uifigure` (available in R2016a+ but most polished in R2020a+)
 - A C compiler configured for MEX (`mex -setup C`) if you need to rebuild the MEX on a new platform
 

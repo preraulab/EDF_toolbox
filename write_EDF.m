@@ -146,7 +146,15 @@ mex_exists = isfile(mex_file);
 
 if ~force_matlab
     if ~mex_exists
-        compile_edf_mex(script_dir, 'write_EDF_mex.c');
+        % Compile failure (e.g. no C compiler configured) must not be
+        % fatal: warn with the fix and drop to the MATLAB writer below.
+        try
+            compile_edf_mex(script_dir, 'write_EDF_mex.c');
+        catch ME
+            warning('write_EDF:MexCompileFailed', ...
+                'Could not compile MEX backend, using slower pure-MATLAB writer.\n%s', ...
+                ME.message);
+        end
     end
     try
         autoscale_mode = double(strcmp(autoscale, 'recompute'));
