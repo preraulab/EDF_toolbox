@@ -48,7 +48,7 @@ cd rust && cargo build --release
 - `header` — struct with main-header metadata (patient ID, record duration, start date/time, etc.)
 - `signal_header` — struct array, one per channel (label, transducer, physical range, sample rate)
 - `signal_cell` — cell array of channel vectors in physical units (scaled from digital)
-- `annotations` — struct array of EDF+ events (`onset` in seconds, `duration` in seconds or `NaN` if none, `text` cell array)
+- `annotations` — struct array of EDF+ events (`onset` in seconds, `duration` in seconds or `NaN` if none, `text` cell array). `write_EDF` preserves all three fields, so annotations round-trip through a read → write with onsets and durations intact.
 
 ## Features
 

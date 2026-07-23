@@ -22,7 +22,10 @@ function write_EDF(out_fname, header, signal_header, signal_cell, varargin)
 %       header        : 1x1 struct (matches read_EDF's first output)
 %       signal_header : 1xN struct array (matches read_EDF's second output)
 %       signal_cell   : 1xN cell array of physical-unit channel vectors
-%       annotations   : Nx1 struct array of {onset, text} (optional, [] OK)
+%       annotations   : Nx1 struct array with fields onset (seconds),
+%                       text (char or cell of char), and optional duration
+%                       (seconds; NaN or absent field emits no duration).
+%                       Optional argument overall, [] OK.
 %
 %   Name-value pairs:
 %       'Channels'    : cell array of expression strings (default {}).
@@ -301,9 +304,13 @@ if annot_idx > 0
         arecs{r}.used = n;
     end
     if isstruct(annotations) && ~isempty(annotations)
+        % 'duration' is optional: structs from older read_EDF versions (or
+        % hand-built ones) have only onset/text. Missing field -> no duration.
+        has_dur = isfield(annotations, 'duration');
         dropped = 0;
         for a = 1:numel(annotations)
             onset = annotations(a).onset;
+            if has_dur, dur = annotations(a).duration; else, dur = nan; end
             target = floor(onset / data_record_duration) + 1;
             target = max(1, min(num_records, target));
             txt = annotations(a).text;
@@ -311,7 +318,7 @@ if annot_idx > 0
             for k = 1:numel(txt)
                 placed = false;
                 for r = target:num_records
-                    [arecs{r}, ok] = append_tal_m(arecs{r}, onset, txt{k});
+                    [arecs{r}, ok] = append_tal_m(arecs{r}, onset, dur, txt{k});
                     if ok, placed = true; break; end
                 end
                 if ~placed, dropped = dropped + 1; break; end
@@ -462,9 +469,38 @@ end
 fwrite(fid, buf, 'char');
 end
 
-function [rec, ok] = append_tal_m(rec, onset, text)
-ts = sprintf('%+g', onset);
-b = uint8([ts 20 uint8(text) 20 0]);
+function [rec, ok] = append_tal_m(rec, onset, duration, text)
+%APPEND_TAL_M  Append one EDF+ TAL to a record's annotation buffer
+%
+%   Inputs:
+%       rec      : struct - annotation record with fields .buf (uint8 row)
+%                  and .used (bytes filled so far) -- required
+%       onset    : double - annotation onset in seconds -- required
+%       duration : double - annotation duration in seconds; NaN emits no
+%                  duration field -- required
+%       text     : char - annotation text -- required
+%
+%   Outputs:
+%       rec : struct - updated record (.buf, .used) when ok is true
+%       ok  : logical - false if the TAL did not fit in the buffer
+%
+%   Notes:
+%       Emits "+onset[<0x15>duration]<0x14>text<0x14><0x00>", matching the
+%       format read_EDF's parser expects. The 0x15 duration field is
+%       written only when duration is not NaN.
+%
+%       Onset/duration are formatted at full precision (integer when whole,
+%       else up to 6 decimals with trailing zeros trimmed). An earlier
+%       '%+g' onset format silently lost sub-second precision past ~1000 s
+%       (6 significant figures), which mattered for full-night onsets; this
+%       matches the MEX writer so both paths round-trip identically.
+ts = fmt_tal_num(onset, true);
+if ~isnan(duration)
+    head = [ts 21 fmt_tal_num(duration, false)];   % onset <0x15> duration
+else
+    head = ts;
+end
+b = uint8([head 20 uint8(text) 20 0]);
 need = numel(b);
 if rec.used + need > numel(rec.buf)
     ok = false;
@@ -473,6 +509,29 @@ end
 rec.buf(rec.used + 1 : rec.used + need) = b;
 rec.used = rec.used + need;
 ok = true;
+end
+
+function s = fmt_tal_num(v, signed)
+%FMT_TAL_NUM  Format an EDF+ TAL onset/duration at full precision
+%
+%   Inputs:
+%       v      : double - value in seconds -- required
+%       signed : logical - true prepends '+' for non-negative values
+%                (onset field requires a sign; duration must not) -- required
+%
+%   Outputs:
+%       s : char - "%d" when v is whole, else "%.6f" with trailing zeros and
+%           any trailing '.' trimmed. Mirrors the MEX writer's formatter.
+if v == floor(v) && abs(v) < 1e15
+    s = sprintf('%d', v);
+else
+    s = sprintf('%.6f', v);
+    s = regexprep(s, '0+$', '');   % trim trailing zeros
+    s = regexprep(s, '\.$', '');   % trim a bare trailing dot
+end
+if signed && v >= 0
+    s = ['+' s];                   % negatives already carry '-' from sprintf
+end
 end
 
 function fclose_safe(fid)

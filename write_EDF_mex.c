@@ -292,17 +292,46 @@ static int format_onset(char *buf, size_t buflen, double v)
     return n;
 }
 
-/* Append a TAL "+onset\x14text\x14\x00" or "+onset\x14\x14\x00".
- * Returns 1 on success, 0 if the buffer is full. */
-static int append_tal(AnnotRecord *r, double onset, const char *text)
+/* Format a non-negative duration as decimal digits (no sign prefix), e.g.
+ * "30" or "1.6875". Same trailing-zero trim as format_onset; EDF+ duration
+ * fields carry no '+'. */
+static int format_duration(char *buf, size_t buflen, double v)
+{
+    int n;
+    if (v == floor(v) && fabs(v) < 1e15) {
+        n = snprintf(buf, buflen, "%lld", (long long)v);
+    } else {
+        n = snprintf(buf, buflen, "%.6f", v);
+        if (n > 0 && strchr(buf, '.')) {
+            int k = n;
+            while (k > 1 && buf[k-1] == '0') k--;
+            if (k > 1 && buf[k-1] == '.') k--;
+            buf[k] = '\0';
+            n = k;
+        }
+    }
+    return n;
+}
+
+/* Append a TAL "+onset[\x15duration]\x14text\x14\x00" (the duration field
+ * is emitted only when `duration` is not NaN). Returns 1 on success, 0 if
+ * the buffer is full. */
+static int append_tal(AnnotRecord *r, double onset, double duration, const char *text)
 {
     char onset_buf[64];
     int olen = format_onset(onset_buf, sizeof(onset_buf), onset);
+    char dur_buf[64];
+    int has_dur = !mxIsNaN(duration);
+    int dlen = has_dur ? format_duration(dur_buf, sizeof(dur_buf), duration) : 0;
     size_t tlen = text ? strlen(text) : 0;
-    /* Total bytes: olen + 0x14 + tlen + 0x14 + 0x00 */
-    size_t need = olen + 1 + tlen + 1 + 1;
+    /* Total bytes: olen [+ 0x15 + dlen] + 0x14 + tlen + 0x14 + 0x00 */
+    size_t need = olen + (has_dur ? 1 + (size_t)dlen : 0) + 1 + tlen + 1 + 1;
     if (r->used + need > r->cap) return 0;
     memcpy(r->bytes + r->used, onset_buf, olen); r->used += olen;
+    if (has_dur) {
+        r->bytes[r->used++] = 0x15;
+        memcpy(r->bytes + r->used, dur_buf, dlen); r->used += dlen;
+    }
     r->bytes[r->used++] = 0x14;
     if (tlen) { memcpy(r->bytes + r->used, text, tlen); r->used += tlen; }
     r->bytes[r->used++] = 0x14;
@@ -559,6 +588,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
             int dropped = 0;
             for (mwSize a = 0; a < n_annot; a++) {
                 double onset = get_scalar_field(m_annot, a, "onset", 0);
+                /* Optional duration field; NaN (or absent) emits no 0x15. */
+                double duration = get_scalar_field(m_annot, a, "duration", mxGetNaN());
                 mwSize target = (mwSize)floor(onset / data_record_duration);
                 if (target >= num_records) target = num_records - 1;
 
@@ -575,7 +606,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
                         /* Try target, then spill forward. */
                         mwSize r;
                         for (r = target; r < num_records; r++) {
-                            if (append_tal(&arecs[r], onset, tbuf)) { placed = 1; break; }
+                            if (append_tal(&arecs[r], onset, duration, tbuf)) { placed = 1; break; }
                         }
                         if (!placed) { dropped++; break; }
                     }
@@ -584,7 +615,7 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
                     mxGetString(t, tbuf, sizeof(tbuf));
                     mwSize r;
                     for (r = target; r < num_records; r++) {
-                        if (append_tal(&arecs[r], onset, tbuf)) { placed = 1; break; }
+                        if (append_tal(&arecs[r], onset, duration, tbuf)) { placed = 1; break; }
                     }
                     if (!placed) dropped++;
                 }
