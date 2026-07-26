@@ -45,6 +45,11 @@ cd rust && cargo build --release
 # default output: .edf.gz (gzip-9, parallel, all cores)
 ```
 
+This raw Cargo command is for a local runtime/development build.
+`rust/target/` is ignored by Git, and its binaries are not covered by the
+DYNAM-O toolbox release path remapping or privacy gate. Do not commit, publish,
+or attach them as release artifacts.
+
 - `header` — struct with main-header metadata (patient ID, record duration, start date/time, etc.)
 - `signal_header` — struct array, one per channel (label, transducer, physical range, sample rate)
 - `signal_cell` — cell array of channel vectors in physical units (scaled from digital)
@@ -391,6 +396,12 @@ The CLI shells out to MATLAB once per invocation — startup cost (~10 s) is amo
 
 For one-shot conversion of hundreds–thousands of files, the standalone Rust binary at `rust/` is **~3× faster** than the MATLAB pipeline and has no MATLAB dependency. It uses `rubato`'s FFT resampler, parallel-gzip via `gzp`, and per-file `rayon` parallelism.
 
+The commands in this section create local development/runtime binaries only.
+Cargo's `rust/target/` output is Git-ignored, and `cargo install --path .`
+copies that local build into the current user's Cargo bin directory. Neither
+path uses the DYNAM-O toolbox release path remapping or privacy gate. Do not
+commit, publish, or attach these binaries as release artifacts.
+
 ```sh
 cd rust
 cargo build --release
@@ -634,10 +645,10 @@ Gaps between segments are filled with `'FillValue'` (physical units, default 0) 
 |---|---|
 | `read_EDF.m` | Read entry point — dispatches to MEX or pure-MATLAB, handles rereferencing, annotations, gz decompression |
 | `read_EDF_mex.c` | C source for the read MEX accelerator |
-| `read_EDF_mex.mexmaca64` | Pre-built read MEX for Apple Silicon |
+| `read_EDF_mex.<mexext>` | Locally generated read MEX for the active platform (Git-ignored) |
 | `write_EDF.m` | Write entry point — mirror of read_EDF (gz-aware, MEX + MATLAB fallback) |
 | `write_EDF_mex.c` | C source for the write MEX accelerator |
-| `write_EDF_mex.mexmaca64` | Pre-built write MEX for Apple Silicon |
+| `write_EDF_mex.<mexext>` | Locally generated write MEX for the active platform (Git-ignored) |
 | `convert_EDF.m` | Read → resample → write helper (one file) |
 | `batch_convert_EDF.m` | Multi-file driver with `parfor` and per-file error handling |
 | `EDF_join.m` | Stitch split EDF segments into one continuous file (sort by start time, verify montage/overlap, gap-fill) |
@@ -646,9 +657,19 @@ Gaps between segments are filled with `'FillValue'` (physical units, default 0) 
 | `zlib/` | Vendored zlib 1.3.2 source (BSD-style license). Compiled into both MEX files so there's no system zlib dependency. |
 | `zstd/` | Vendored zstd 1.5.7 single-file amalgamation (BSD license). Compiled into both MEX files so there's no system libzstd dependency — including on Windows. |
 | `header_gui.m` | Optional UI for inspecting header + signal-header tables |
-| `rust/` | Optional standalone Rust port of the read → resample → write pipeline. Roughly 3× faster than the MATLAB pipeline on the same hardware; useful for one-shot batch conversion of large corpora. Build with `cd rust && cargo build --release`. |
+| `rust/` | Optional standalone Rust port of the read → resample → write pipeline. Roughly 3× faster than the MATLAB pipeline on the same hardware; useful for one-shot batch conversion of large corpora. Raw Cargo builds are local-only as described above. |
 
-If a pre-built MEX isn't available for your platform (Linux, Windows), `read_EDF.m` and `write_EDF.m` will auto-compile on first call. The build pulls in the vendored zlib **and** vendored zstd sources, so **no system libraries are required on any platform** — the only prerequisite is a C compiler configured for MEX. If compilation fails, the toolbox warns and falls back to the (slower) pure-MATLAB backend, so nothing breaks. To rebuild manually:
+If a MEX isn't available for your platform, `read_EDF.m` and `write_EDF.m`
+auto-compile one on first call. The resulting `*.mex*` files are ignored local
+runtime artifacts. This automatic build is not part of the DYNAM-O toolbox
+release path remapping or privacy gate, so do not commit, publish, or attach
+the generated MEX files as release artifacts.
+
+The build pulls in the vendored zlib **and** vendored zstd sources, so **no
+system libraries are required on any platform** — the only prerequisite is a
+C compiler configured for MEX. If compilation fails, the toolbox warns and
+falls back to the (slower) pure-MATLAB backend, so nothing breaks. To rebuild
+manually for local use:
 
 ```matlab
 % From the EDF_toolbox directory
