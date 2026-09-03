@@ -48,13 +48,27 @@ function [sh_out, sc_out] = apply_channel_derivations(sh_in, sc_in, channels, re
 %   pipeline is needed at all (callers route around it for plain label
 %   subsets / legacy 'A-B' strings handled by the MEX backend).
 %
+%   mean(...) averages the AVAILABLE channels. Cohorts often name the
+%   same montage differently across files, so a reference may list
+%   every spelling — M = mean($C3-A2$, $[C3-A2 - B]$) — and each file
+%   takes the mean over the arguments whose channels it actually has
+%   (renormalized 1/M over the M available; error only when none are).
+%   An argument counts only when every channel inside it is present.
+%   When all N arguments are present the arithmetic is the exact 1/N
+%   strict mean, unchanged. Quote each spelling in '$...$' so absent
+%   ones parse as unresolved leaves rather than tripping ParseError.
+%
 %   Diagnostics. RateMismatch and BadMean always error.
 %   UnknownChannel, ParseError, and RefCollision raised inside a
 %   'Channels' entry are demoted to warnings — the offending entry is
-%   skipped and the remaining channels still load. The same conditions
-%   inside a 'References' entry remain hard errors, since references
-%   are foundation pieces. The 'read_EDF:' prefix is preserved
-%   regardless of caller so existing handlers keep working.
+%   skipped and the remaining channels still load. Inside a
+%   'References' entry, structural problems (ParseError, RefCollision,
+%   RateMismatch, BadMean) remain hard errors — they are wrong in every
+%   file — but AVAILABILITY (UnknownChannel: the file simply lacks the
+%   channels) skips that reference with a warning, and only the
+%   'Channels' entries that use it then fail, per the usual per-entry
+%   policy. The 'read_EDF:' prefix is preserved regardless of caller so
+%   existing handlers keep working.
 
 if nargin < 6, dry_run = false; end
 if nargin < 5, verbose = false; end
@@ -101,6 +115,11 @@ for k = 1:numel(channels)
         if isempty(user_alias)
             spec.label = spec_str;
         end
+
+        % mean() over the channels this file has: drop the mean arguments
+        % whose channels are absent, renormalize the rest. No-op when
+        % everything (or nothing mean-shaped) is present.
+        spec = resolve_mean_availability(spec, aug_labels, spec_str);
 
         leaf_idx = zeros(1, numel(spec.leaves));
         for j = 1:numel(spec.leaves)
@@ -240,20 +259,41 @@ for k = 1:numel(refs)
 
     aug_labels = {sh_aug.signal_labels};
 
-    wrapped = preprocess_spec(body, aug_labels);
-    if verbose
-        fprintf('apply_channel_derivations: ''%s = %s''  ->  ''%s = %s''\n', name, body, name, wrapped);
-    end
-
-    spec = parse_expr_string(wrapped, aug_labels);
-
-    leaf_idx = zeros(1, numel(spec.leaves));
-    for j = 1:numel(spec.leaves)
-        leaf_idx(j) = find_label_idx(aug_labels, spec.leaves{j});
-        if leaf_idx(j) == 0
-            error('read_EDF:UnknownChannel', ...
-                'Unknown channel ''%s'' in reference ''%s''.', spec.leaves{j}, s);
+    % Availability is per file: a reference whose channels this file
+    % simply doesn't have is SKIPPED (warning, not error), so cohorts
+    % mixing montage naming schemes can declare one reference per
+    % scheme. Only the output channels that use a skipped reference
+    % fail — and those are already demoted per-entry by the caller.
+    % Structural problems (ParseError, RefCollision, RateMismatch,
+    % BadMean) stay hard errors: they are wrong in every file.
+    try
+        wrapped = preprocess_spec(body, aug_labels);
+        if verbose
+            fprintf('apply_channel_derivations: ''%s = %s''  ->  ''%s = %s''\n', name, body, name, wrapped);
         end
+
+        spec = parse_expr_string(wrapped, aug_labels);
+
+        % mean() over the channels this file has (see the helper).
+        spec = resolve_mean_availability(spec, aug_labels, s);
+
+        leaf_idx = zeros(1, numel(spec.leaves));
+        for j = 1:numel(spec.leaves)
+            leaf_idx(j) = find_label_idx(aug_labels, spec.leaves{j});
+            if leaf_idx(j) == 0
+                error('read_EDF:UnknownChannel', ...
+                    'Unknown channel ''%s'' in reference ''%s''.', spec.leaves{j}, s);
+            end
+        end
+    catch ME
+        if strcmp(ME.identifier, 'read_EDF:UnknownChannel')
+            if ~dry_run
+                warning('read_EDF:UnknownChannel', ...
+                    'Skipping reference ''%s'' (not available in this file): %s', name, ME.message);
+            end
+            continue
+        end
+        rethrow(ME);
     end
 
     rates = zeros(1, numel(leaf_idx));
@@ -289,6 +329,66 @@ for k = 1:numel(refs)
         sc_aug{end+1}  = sig;     %#ok<AGROW>
     end
     ref_names_lower{end+1} = name_lower; %#ok<AGROW>
+end
+end
+
+
+function spec = resolve_mean_availability(spec, aug_labels, where_str)
+%RESOLVE_MEAN_AVAILABILITY  mean() averages the channels this file has.
+%
+%   Each mean(...) was parsed with its leaves stamped (grp/arg/grpn). An
+%   argument is available only when EVERY leaf inside it resolves
+%   against AUG_LABELS. Unavailable arguments are dropped and the kept
+%   ones renormalized from the parse-time 1/N to 1/M (M = number
+%   available), so a reference can list every cohort spelling of a
+%   montage — mean($C3-A2$, $[C3-A2 - B]$) — and each file uses the
+%   spellings it carries. When all N are available the spec is returned
+%   untouched (bit-identical arithmetic to the historical strict mean).
+%   A mean with NO available argument raises read_EDF:UnknownChannel,
+%   which the callers demote per their usual per-entry policy. Leaves
+%   outside any mean are left for the callers' own resolution errors.
+if isempty(spec.grp) || all(spec.grp == 0)
+    return
+end
+
+present = false(1, numel(spec.leaves));
+for j = 1:numel(spec.leaves)
+    present(j) = find_label_idx(aug_labels, spec.leaves{j}) > 0;
+end
+
+drop = false(1, numel(spec.leaves));
+groups = unique(spec.grp(spec.grp > 0));
+for gi = 1:numel(groups)
+    g = groups(gi);
+    in_g = spec.grp == g;
+    args = unique(spec.arg(in_g));
+    n_avail = 0;
+    for ai = 1:numel(args)
+        in_arg = in_g & spec.arg == args(ai);
+        if all(present(in_arg))
+            n_avail = n_avail + 1;
+        else
+            drop(in_arg) = true;
+        end
+    end
+    if n_avail == 0
+        error('read_EDF:UnknownChannel', ...
+            'mean() in ''%s'': none of its channels are available (wanted any of ''%s'').', ...
+            where_str, strjoin(spec.leaves(in_g), ''', '''));
+    end
+    N = spec.grpn(find(in_g, 1));
+    if n_avail < N
+        rescale = in_g & ~drop;
+        spec.terms(rescale) = spec.terms(rescale) * (N / n_avail);
+    end
+end
+
+if any(drop)
+    spec.terms(drop)  = [];
+    spec.leaves(drop) = [];
+    spec.grp(drop)    = [];
+    spec.arg(drop)    = [];
+    spec.grpn(drop)   = [];
 end
 end
 
@@ -446,7 +546,8 @@ else
 end
 
 spec = struct('label', out_label, ...
-    'terms', result.coefs, 'leaves', {result.leaves});
+    'terms', result.coefs, 'leaves', {result.leaves}, ...
+    'grp', result.grp, 'arg', result.arg, 'grpn', result.grpn);
 end
 
 
@@ -505,12 +606,21 @@ if ch == '('
     r = inner;
 
 elseif ch == '$'
-    [cur, label] = match_longest_label(body, cur, all_labels, labels_lower, len_order);
+    [cur, label, quoted_raw] = match_longest_label(body, cur, all_labels, labels_lower, len_order);
     if isempty(label)
-        error('read_EDF:UnknownChannel', ...
-            'No matching channel at position %d in ''%s''.', cur, original);
+        if isempty(quoted_raw)
+            error('read_EDF:UnknownChannel', ...
+                'No matching channel at position %d in ''%s''.', cur, original);
+        end
+        % A well-formed '$...$' token naming a channel this file does not
+        % have: keep it as an unresolved leaf instead of failing the
+        % parse. If it sits inside a mean(...), the availability pass
+        % drops that argument; anywhere else, leaf resolution raises the
+        % same read_EDF:UnknownChannel it always did.
+        r = vec_factor(1.0, quoted_raw);
+    else
+        r = vec_factor(1.0, label);
     end
-    r = vec_factor(1.0, label);
 
 elseif (ch >= '0' && ch <= '9') || ch == '.'
     [val, cur] = parse_number(body, cur, original);
@@ -576,7 +686,16 @@ if N < 2
         'mean(...) needs at least 2 arguments in ''%s''.', original);
 end
 
-% mean = (1/N) * sum_i args_i. Each arg must be a vector (linear comb).
+% mean = (1/N) * sum_i args_i, evaluated over the arguments the file
+% actually has: every leaf is stamped with (group, argument, N) so
+% resolve_mean_availability can drop the arguments whose channels are
+% absent and renormalize the rest to 1/M. With all N available nothing
+% is touched, so fully-covered files keep the exact 1/N arithmetic.
+% The group id is this mean's character position in the spec — unique
+% within one parse. Stamping OVERWRITES any marks from a nested inner
+% mean: an inner mean is all-or-nothing within its enclosing argument
+% (only the outermost mean adapts).
+g = cur;
 r = empty_vec();
 for k = 1:N
     a = args{k};
@@ -585,6 +704,9 @@ for k = 1:N
             'mean() argument %d is a pure scalar in ''%s''.', k, original);
     end
     a = scale_result(a, 1/N);
+    a.grp(:)  = g;
+    a.arg(:)  = k;
+    a.grpn(:) = N;
     r = combine_add(r, a, original);
 end
 end
@@ -620,18 +742,26 @@ end
 end
 
 
+% Result structs carry three arrays parallel to coefs/leaves recording
+% mean() membership: grp (mean-group id, 0 = not inside a mean), arg
+% (argument index within the group), grpn (the group's total argument
+% count N). resolve_mean_availability uses them to drop the arguments a
+% file doesn't have and renormalize the rest — see that function.
 function r = scalar_factor(v)
-r = struct('is_scalar', true, 'scalar', v, 'coefs', [], 'leaves', {{}});
+r = struct('is_scalar', true, 'scalar', v, 'coefs', [], 'leaves', {{}}, ...
+    'grp', [], 'arg', [], 'grpn', []);
 end
 
 
 function r = vec_factor(coef, label)
-r = struct('is_scalar', false, 'scalar', 0, 'coefs', coef, 'leaves', {{label}});
+r = struct('is_scalar', false, 'scalar', 0, 'coefs', coef, 'leaves', {{label}}, ...
+    'grp', 0, 'arg', 0, 'grpn', 0);
 end
 
 
 function r = empty_vec()
-r = struct('is_scalar', false, 'scalar', 0, 'coefs', [], 'leaves', {{}});
+r = struct('is_scalar', false, 'scalar', 0, 'coefs', [], 'leaves', {{}}, ...
+    'grp', [], 'arg', [], 'grpn', []);
 end
 
 
@@ -654,7 +784,10 @@ elseif a.is_scalar || b.is_scalar
 else
     r = struct('is_scalar', false, 'scalar', 0, ...
         'coefs', [a.coefs, b.coefs], ...
-        'leaves', {[a.leaves, b.leaves]});
+        'leaves', {[a.leaves, b.leaves]}, ...
+        'grp',  [a.grp,  b.grp], ...
+        'arg',  [a.arg,  b.arg], ...
+        'grpn', [a.grpn, b.grpn]);
 end
 end
 
@@ -697,7 +830,11 @@ end
 end
 
 
-function [cur, label] = match_longest_label(body, cur, all_labels, labels_lower, len_order)
+function [cur, label, quoted_raw] = match_longest_label(body, cur, all_labels, labels_lower, len_order)
+% Third output: the raw text of a well-formed '$...$' token when it did
+% not match any label ('' otherwise) — lets the caller keep an unknown
+% quoted channel as an unresolved leaf rather than failing the parse.
+quoted_raw = '';
 cur = skip_ws(body, cur);
 if cur > length(body)
     label = '';
@@ -718,6 +855,9 @@ if body(cur) == '$'
             label = all_labels{k};
             break
         end
+    end
+    if isempty(label)
+        quoted_raw = quoted;
     end
     cur = cur + end_pos(1) + 1;
     return

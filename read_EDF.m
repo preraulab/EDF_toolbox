@@ -127,7 +127,14 @@ function varargout = read_EDF(edf_fname, varargin)
 %   are visible by name to subsequent Channels entries (chaining);
 %   unaliased entries are one-shot.
 %
-%   mean(arg1, ..., argN) requires N >= 2 and produces (1/N) * sum_i argi.
+%   mean(arg1, ..., argN) requires N >= 2 and averages the arguments
+%   whose channels THIS FILE actually has: (1/M) * sum over the M
+%   available arguments (an argument counts only when every channel
+%   inside it is present; error when none are). With all N present this
+%   is the exact (1/N) * sum_i argi. Cohorts that name one montage
+%   differently across files can therefore list every spelling —
+%   'M = mean($C3-A2$, $[C3-A2 - B]$)' — and each file uses the
+%   spellings it carries; quote each spelling in '$...$'.
 %   Args may be expressions, not just leaves: mean(C1, C2-C3) works.
 %
 %   Examples (each comment is the equivalent math):
@@ -213,9 +220,13 @@ function varargout = read_EDF(edf_fname, varargin)
 %   -------------------------------------------------------------------------
 %   Constraints. A per-entry resolution failure on a 'Channels' spec is
 %   demoted to a warning (warn + skip that entry, keep loading the
-%   rest); the same failure inside a 'References' entry is still a
-%   hard error, since References are foundation pieces other channels
-%   may depend on.
+%   rest). Inside a 'References' entry, structural failures (ParseError,
+%   RefCollision, RateMismatch, BadMean) are still hard errors, but an
+%   AVAILABILITY failure — the file simply lacks the reference's
+%   channels — skips that reference with a warning, and only the
+%   'Channels' entries that use it then fail, per the usual per-entry
+%   policy. That lets a cohort declare one reference per montage naming
+%   scheme.
 %
 %   Demoted to warnings on a 'Channels' entry (errors elsewhere):
 %       read_EDF:UnknownChannel  - a leaf in an expression doesn't
