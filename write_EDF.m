@@ -130,6 +130,23 @@ for k = 1:numel(fields_to_drop)
     end
 end
 
+% Normalize text fields to char row vectors. The MEX's get_string_field
+% requires mxChar and SILENTLY writes an empty field for anything else —
+% so a caller building headers with MATLAB string objects (e.g.
+% 'signal_labels', num2cell(string(1:64))) produced EDFs whose channel
+% labels were all blank. Coerce string / numeric values here, at the one
+% choke point both backends share, and refuse anything unconvertible.
+header = normalize_text_fields(header, ...
+    {'edf_ver', 'patient_id', 'local_rec_id', 'recording_startdate', 'recording_starttime'});
+signal_header = normalize_text_fields(signal_header, ...
+    {'signal_labels', 'transducer_type', 'physical_dimension', 'prefiltering'});
+for i = 1:numel(signal_header)
+    if isempty(strtrim(signal_header(i).signal_labels))
+        warning('write_EDF:EmptyLabel', ...
+            'signal %d has an empty label — readers will only be able to address it by position', i);
+    end
+end
+
 % Optional derivation pass: when 'Channels' or 'References' is provided,
 % transform the input (signal_header, signal_cell) using the same
 % expression syntax read_EDF accepts. Result replaces the inputs going
@@ -544,4 +561,32 @@ function s = shell_quote(s)
 % POSIX shell single-quoting; suitable for the Bash that MATLAB system()
 % invokes on macOS / Linux. Embeds any single quotes safely.
 s = ['''' strrep(s, '''', '''\''''') ''''];
+end
+
+function s = normalize_text_fields(s, fields)
+%NORMALIZE_TEXT_FIELDS  Coerce the named struct fields to char row vectors.
+%
+%   Accepts char (unchanged), MATLAB string scalars, and numeric scalars
+%   (formatted with %g — a label like 3 becomes '3'). Anything else is a
+%   hard error naming the field and element, because the MEX backend
+%   would otherwise write it as an EMPTY field with no diagnostic.
+for k = 1:numel(fields)
+    fn = fields{k};
+    if ~isfield(s, fn), continue; end
+    for i = 1:numel(s)
+        v = s(i).(fn);
+        if ischar(v)
+            continue
+        elseif isstring(v) && isscalar(v)
+            s(i).(fn) = char(v);
+        elseif isnumeric(v) && isscalar(v)
+            s(i).(fn) = sprintf('%g', v);
+        elseif isempty(v)
+            s(i).(fn) = '';
+        else
+            error('write_EDF:Input', ...
+                '%s(%d) must be char or string, got %s', fn, i, class(v));
+        end
+    end
+end
 end
